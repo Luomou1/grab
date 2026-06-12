@@ -816,6 +816,33 @@ def CameraSetImageResolution(hCamera, pImageResolution):
 	SetLastError(err_code)
 	return err_code
 
+def CameraGetImageResolutionEx(hCamera):
+	iIndex = c_int()
+	acDescription = create_string_buffer(32)
+	Mode = c_int()
+	ModeSize = c_uint()
+	x = c_int()
+	y = c_int()
+	width = c_int()
+	height = c_int()
+	ZoomWidth = c_int()
+	ZoomHeight = c_int()
+	err_code = _sdk.CameraGetImageResolutionEx(
+		hCamera,
+		byref(iIndex),
+		acDescription,
+		byref(Mode),
+		byref(ModeSize),
+		byref(x),
+		byref(y),
+		byref(width),
+		byref(height),
+		byref(ZoomWidth),
+		byref(ZoomHeight),
+	)
+	SetLastError(err_code)
+	return (iIndex.value, Mode.value, ModeSize.value, x.value, y.value, width.value, height.value, ZoomWidth.value, ZoomHeight.value)
+
 def CameraSetImageResolutionEx(hCamera, iIndex, Mode, ModeSize, x, y, width, height, ZoomWidth, ZoomHeight):
 	err_code = _sdk.CameraSetImageResolutionEx(hCamera, iIndex, Mode, ModeSize, x, y, width, height, ZoomWidth, ZoomHeight)
 	SetLastError(err_code)

@@ -108,6 +108,8 @@ def _prepare_sdk_paths(paths: CameraSdkPaths | None = None) -> None:
 
 
 class CameraController:
+    _SENSOR_ROI_ALIGN = 8
+
     def __init__(self, sdk_paths: CameraSdkPaths | None = None) -> None:
         _prepare_sdk_paths(sdk_paths)
         self._mvsdk = importlib.import_module("grab_app.camera.mvsdk")
@@ -361,13 +363,30 @@ class CameraController:
     def roi(self) -> CameraRoi:
         if self.cap is None:
             raise CameraError("相机未初始化")
-        current = self._mvsdk.CameraGetImageResolution(self.h_camera)
         limit = self.cap.sResolutionRange
+        try:
+            _, _, _, sensor_x, sensor_y, width, height, _, _ = self._mvsdk.CameraGetImageResolutionEx(self.h_camera)
+            x, y = self._sensor_roi_to_display_roi(
+                int(sensor_x),
+                int(sensor_y),
+                int(width),
+                int(height),
+                int(limit.iWidthMax),
+                int(limit.iHeightMax),
+            )
+            width = int(width)
+            height = int(height)
+        except Exception:
+            current = self._mvsdk.CameraGetImageResolution(self.h_camera)
+            x = int(current.iHOffsetFOV)
+            y = int(current.iVOffsetFOV)
+            width = int(current.iWidthFOV or current.iWidth)
+            height = int(current.iHeightFOV or current.iHeight)
         return CameraRoi(
-            x=int(current.iHOffsetFOV),
-            y=int(current.iVOffsetFOV),
-            width=int(current.iWidthFOV or current.iWidth),
-            height=int(current.iHeightFOV or current.iHeight),
+            x=x,
+            y=y,
+            width=width,
+            height=height,
             max_width=int(limit.iWidthMax),
             max_height=int(limit.iHeightMax),
             min_width=int(limit.iWidthMin),
@@ -381,10 +400,10 @@ class CameraController:
         if self.cap is None:
             raise CameraError("相机未初始化")
         limit = self.cap.sResolutionRange
-        min_width = int(limit.iWidthMin)
-        min_height = int(limit.iHeightMin)
-        max_width = int(limit.iWidthMax)
-        max_height = int(limit.iHeightMax)
+        min_width = int(limit.iWidthMin or 0)
+        min_height = int(limit.iHeightMin or 0)
+        max_width = int(limit.iWidthMax or 0)
+        max_height = int(limit.iHeightMax or 0)
         x, y, width, height = self._normalize_sensor_roi(
             int(x),
             int(y),
@@ -395,30 +414,29 @@ class CameraController:
             max_width,
             max_height,
         )
-        if width < min_width or height < min_height:
-            raise CameraError(f"ROI 尺寸小于相机限制: 最小 {min_width}x{min_height}")
-        if x < 0 or y < 0 or x + width > max_width or y + height > max_height:
-            raise CameraError(f"ROI 超出传感器范围: 最大 {max_width}x{max_height}")
+        safe_min_width, safe_min_height, safe_max_width, safe_max_height = self._safe_sensor_roi_limits(
+            min_width,
+            min_height,
+            max_width,
+            max_height,
+        )
+        if width < safe_min_width or height < safe_min_height:
+            raise CameraError(f"ROI 尺寸小于相机限制: 最小 {safe_min_width}x{safe_min_height}")
+        if x < 0 or y < 0 or x + width > safe_max_width or y + height > safe_max_height:
+            raise CameraError(f"ROI 超出传感器范围: 最大 {safe_max_width}x{safe_max_height}")
 
         with self._control_lock:
             self._try_call("CameraStop")
             try:
-                resolution = self._mvsdk.CameraGetImageResolution(self.h_camera)
-                resolution.iIndex = 0xFF
-                resolution.uBinSumMode = 0
-                resolution.uBinAverageMode = 0
-                resolution.uSkipMode = 0
-                resolution.iHOffsetFOV = x
-                resolution.iVOffsetFOV = y
-                resolution.iWidthFOV = width
-                resolution.iHeightFOV = height
-                resolution.iWidth = width
-                resolution.iHeight = height
-                resolution.iWidthZoomHd = 0
-                resolution.iHeightZoomHd = 0
-                resolution.iWidthZoomSw = 0
-                resolution.iHeightZoomSw = 0
-                err_code = self._mvsdk.CameraSetImageResolution(self.h_camera, resolution)
+                sensor_x, sensor_y, sensor_width, sensor_height = self._display_roi_to_sensor_roi(
+                    x,
+                    y,
+                    width,
+                    height,
+                    safe_max_width,
+                    safe_max_height,
+                )
+                err_code = self._set_sensor_roi_resolution(sensor_x, sensor_y, sensor_width, sensor_height)
                 if err_code:
                     raise CameraError(f"设置 ROI 失败，SDK 错误码: {err_code}")
                 self.width = width
@@ -438,6 +456,71 @@ class CameraController:
         limit = self.cap.sResolutionRange
         return self.set_sensor_roi(0, 0, int(limit.iWidthMax), int(limit.iHeightMax))
 
+    def _safe_sensor_roi_limits(
+        self,
+        min_width: int,
+        min_height: int,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[int, int, int, int]:
+        align = self._SENSOR_ROI_ALIGN
+        max_width = int(max_width or 0)
+        max_height = int(max_height or 0)
+        if max_width <= 0 or max_height <= 0:
+            raise CameraError(f"相机返回的 ROI 最大范围无效: {max_width}x{max_height}")
+
+        min_width = max(1, int(min_width or 0))
+        min_height = max(1, int(min_height or 0))
+        min_width = min(max_width, max(align, ((min_width + align - 1) // align) * align))
+        min_height = min(max_height, max(align, ((min_height + align - 1) // align) * align))
+        return min_width, min_height, max_width, max_height
+
+    def _set_sensor_roi_resolution(self, x: int, y: int, width: int, height: int) -> int:
+        try:
+            return int(self._mvsdk.CameraSetImageResolutionEx(self.h_camera, 0xFF, 0, 0, x, y, width, height, 0, 0))
+        except AttributeError:
+            resolution = self._mvsdk.CameraGetImageResolution(self.h_camera)
+            resolution.iIndex = 0xFF
+            resolution.uBinSumMode = 0
+            resolution.uBinAverageMode = 0
+            resolution.uSkipMode = 0
+            resolution.iHOffsetFOV = x
+            resolution.iVOffsetFOV = y
+            resolution.iWidthFOV = width
+            resolution.iHeightFOV = height
+            resolution.iWidth = width
+            resolution.iHeight = height
+            resolution.iWidthZoomHd = 0
+            resolution.iHeightZoomHd = 0
+            resolution.iWidthZoomSw = 0
+            resolution.iHeightZoomSw = 0
+            return int(self._mvsdk.CameraSetImageResolution(self.h_camera, resolution))
+
+    @staticmethod
+    def _display_roi_to_sensor_roi(
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        _max_width: int,
+        max_height: int,
+    ) -> tuple[int, int, int, int]:
+        # SDK 的 sensor ROI 使用传感器坐标；CameraImageProcess 输出图像与 sensor 的 Y 方向相反。
+        sensor_y = max(0, int(max_height) - int(y) - int(height))
+        return int(x), sensor_y, int(width), int(height)
+
+    @staticmethod
+    def _sensor_roi_to_display_roi(
+        sensor_x: int,
+        sensor_y: int,
+        width: int,
+        height: int,
+        _max_width: int,
+        max_height: int,
+    ) -> tuple[int, int]:
+        display_y = max(0, int(max_height) - int(sensor_y) - int(height))
+        return int(sensor_x), display_y
+
     def _normalize_sensor_roi(
         self,
         x: int,
@@ -449,16 +532,23 @@ class CameraController:
         max_width: int,
         max_height: int,
     ) -> tuple[int, int, int, int]:
-        # 多数工业相机的自定义 ROI 需要偶数对齐；SDK 不一定会显式报错，但可能停止出帧。
-        align = 2
+        # 自定义 sensor ROI 对硬件步进更敏感；统一 8 像素对齐，避免 SDK 接受参数后停止出帧。
+        align = self._SENSOR_ROI_ALIGN
+        min_width, min_height, max_width, max_height = self._safe_sensor_roi_limits(
+            min_width,
+            min_height,
+            max_width,
+            max_height,
+        )
+
         x = max(0, min(x, max_width - min_width))
         y = max(0, min(y, max_height - min_height))
         x = (x // align) * align
         y = (y // align) * align
         width = max(min_width, min(width, max_width - x))
         height = max(min_height, min(height, max_height - y))
-        width = max(min_width, (width // align) * align)
-        height = max(min_height, (height // align) * align)
+        width = min(max_width - x, max(min_width, (width // align) * align))
+        height = min(max_height - y, max(min_height, (height // align) * align))
         if x + width > max_width:
             x = max(0, max_width - width)
             x = (x // align) * align

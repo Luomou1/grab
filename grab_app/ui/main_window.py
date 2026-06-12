@@ -273,6 +273,94 @@ class RoiPreviewLabel(QLabel):
         height = max(1, bottom - y)
         return x, y, width, height
 
+
+class RoiSnapshotLabel(QLabel):
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self._source_width = 0
+        self._source_height = 0
+        self._origin_x = 0
+        self._origin_y = 0
+        self._roi: tuple[int, int, int, int] | None = None
+        self.setAlignment(Qt.AlignCenter)
+
+    def set_snapshot(
+        self,
+        pixmap: QPixmap,
+        source_width: int,
+        source_height: int,
+        origin_x: int = 0,
+        origin_y: int = 0,
+    ) -> None:
+        self._source_width = max(0, int(source_width))
+        self._source_height = max(0, int(source_height))
+        self._origin_x = max(0, int(origin_x))
+        self._origin_y = max(0, int(origin_y))
+        self.setPixmap(pixmap)
+        self.update()
+
+    def set_roi(self, x: int, y: int, width: int, height: int) -> None:
+        self._roi = (int(x), int(y), int(width), int(height))
+        self.update()
+
+    def clear_snapshot(self) -> None:
+        self._source_width = 0
+        self._source_height = 0
+        self._origin_x = 0
+        self._origin_y = 0
+        self._roi = None
+        self.clear()
+        self.setText("无预览")
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self.pixmap() is None or self._roi is None or self._source_width <= 0 or self._source_height <= 0:
+            return
+        visible_roi = self._visible_roi()
+        if visible_roi is None:
+            return
+
+        pixmap_rect = self._pixmap_rect()
+        x, y, width, height = visible_roi
+        x_scale = pixmap_rect.width() / max(self._source_width, 1)
+        y_scale = pixmap_rect.height() / max(self._source_height, 1)
+        draw_rect = QRect(
+            pixmap_rect.left() + round(x * x_scale),
+            pixmap_rect.top() + round(y * y_scale),
+            max(1, round(width * x_scale)),
+            max(1, round(height * y_scale)),
+        )
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#18d2d0"), 2))
+        painter.setBrush(QColor(24, 210, 208, 36))
+        painter.drawRect(draw_rect.adjusted(0, 0, -1, -1))
+
+    def _pixmap_rect(self) -> QRect:
+        pixmap = self.pixmap()
+        if pixmap is None:
+            return QRect()
+        size = pixmap.size()
+        left = max(0, (self.width() - size.width()) // 2)
+        top = max(0, (self.height() - size.height()) // 2)
+        return QRect(left, top, size.width(), size.height())
+
+    def _visible_roi(self) -> tuple[int, int, int, int] | None:
+        if self._roi is None:
+            return None
+        roi_x, roi_y, roi_w, roi_h = self._roi
+        local_x = roi_x - self._origin_x
+        local_y = roi_y - self._origin_y
+        left = max(0, local_x)
+        top = max(0, local_y)
+        right = min(self._source_width, local_x + roi_w)
+        bottom = min(self._source_height, local_y + roi_h)
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right - left, bottom - top
+
+
 def frame_to_pixmap(frame: np.ndarray, width: int, height: int) -> QPixmap:
     if frame.ndim == 2:
         if frame.dtype == np.uint16:
@@ -350,7 +438,6 @@ class MainWindow(QMainWindow):
         self.camera_settings_dialog = self._settings_dialog("相机与预览", self._camera_box())
         self.image_settings_dialog = self._settings_dialog("图像设置", self._image_section())
         self.roi_settings_panel = self._roi_section()
-        self.roi_settings_panel.setParent(self)
         self.roi_settings_panel.hide()
         self.pzt_settings_dialog = self._settings_dialog("PZT 位移", self._pzt_box())
         self.log_dialog = self._settings_dialog("运行日志", self._log_panel())
@@ -384,7 +471,7 @@ class MainWindow(QMainWindow):
                 "image",
             )
         )
-        self.btn_roi_select = self._action_button("ROI 框选", "roi", self._activate_roi_selection)
+        self.btn_roi_select = self._action_button("传感器 ROI", "roi", self._activate_roi_selection)
         self.btn_roi_select.setCheckable(True)
         top_bar_layout.addWidget(self.btn_roi_select)
         top_bar_layout.addWidget(
@@ -444,6 +531,7 @@ class MainWindow(QMainWindow):
         side_layout.addWidget(self._scan_tabs())
         side_layout.addWidget(self._calibration_box())
         side_layout.addWidget(self._save_box())
+        side_layout.addWidget(self.roi_settings_panel)
         side_layout.addWidget(self._scan_actions())
         side_layout.addStretch()
 
@@ -612,37 +700,57 @@ class MainWindow(QMainWindow):
         self.sharpness_slider.valueChanged.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_sharpness(v)))
         return content
 
-    def _roi_section(self) -> QFrame:
-        content = QFrame()
-        content.setObjectName("collapsibleContent")
-        layout = QGridLayout(content)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setHorizontalSpacing(8)
-        layout.setVerticalSpacing(8)
+    def _roi_section(self) -> QGroupBox:
+        content = QGroupBox("ROI 预览")
+        content.setObjectName("roiPanel")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 8, 0, 4)
+        layout.setSpacing(7)
 
         self.roi_enabled = QCheckBox("启用传感器 ROI")
+        self.roi_enabled.hide()
+        self.roi_snapshot = RoiSnapshotLabel("无预览")
+        self.roi_snapshot.setObjectName("roiSnapshot")
+        self.roi_snapshot.setMinimumHeight(230)
+        self.roi_snapshot.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
         self.roi_x = self._ispin(0, 100000, 0)
         self.roi_y = self._ispin(0, 100000, 0)
         self.roi_w = self._ispin(1, 100000, 1280)
         self.roi_h = self._ispin(1, 100000, 1024)
         self.btn_apply_roi = QPushButton("应用")
+        self.btn_restore_roi = QPushButton("恢复")
         self.btn_reset_roi = QPushButton("全幅")
         self.btn_apply_roi.setObjectName("primaryButton")
+        self.btn_restore_roi.setObjectName("secondaryButton")
         self.btn_reset_roi.setObjectName("secondaryButton")
 
-        layout.addWidget(self.roi_enabled, 0, 0, 1, 4)
-        layout.addWidget(self._label("X"), 1, 0)
-        layout.addWidget(self.roi_x, 1, 1)
-        layout.addWidget(self._label("Y"), 1, 2)
-        layout.addWidget(self.roi_y, 1, 3)
-        layout.addWidget(self._label("宽"), 2, 0)
-        layout.addWidget(self.roi_w, 2, 1)
-        layout.addWidget(self._label("高"), 2, 2)
-        layout.addWidget(self.roi_h, 2, 3)
-        layout.addWidget(self.btn_apply_roi, 3, 2)
-        layout.addWidget(self.btn_reset_roi, 3, 3)
+        coord_grid = QGridLayout()
+        coord_grid.setContentsMargins(0, 0, 0, 0)
+        coord_grid.setHorizontalSpacing(6)
+        coord_grid.setVerticalSpacing(6)
+        coord_grid.addWidget(self._label("X"), 0, 0)
+        coord_grid.addWidget(self.roi_x, 0, 1)
+        coord_grid.addWidget(self._label("Y"), 0, 2)
+        coord_grid.addWidget(self.roi_y, 0, 3)
+        coord_grid.addWidget(self._label("宽"), 1, 0)
+        coord_grid.addWidget(self.roi_w, 1, 1)
+        coord_grid.addWidget(self._label("高"), 1, 2)
+        coord_grid.addWidget(self.roi_h, 1, 3)
+
+        button_row = QHBoxLayout()
+        button_row.setContentsMargins(0, 0, 0, 0)
+        button_row.setSpacing(8)
+        button_row.addWidget(self.btn_apply_roi)
+        button_row.addWidget(self.btn_restore_roi)
+        button_row.addWidget(self.btn_reset_roi)
+
+        layout.addWidget(self.roi_snapshot)
+        layout.addLayout(coord_grid)
+        layout.addLayout(button_row)
 
         self.btn_apply_roi.clicked.connect(self._apply_roi)
+        self.btn_restore_roi.clicked.connect(self._restore_roi_full_frame)
         self.btn_reset_roi.clicked.connect(self._reset_roi)
         return content
 
@@ -905,7 +1013,7 @@ class MainWindow(QMainWindow):
 
     def _activate_roi_selection(self) -> None:
         if self._roi_selection_active:
-            self._deactivate_roi_selection()
+            self._deactivate_roi_selection(restore_full=True)
             return
         if not self.camera.initialized:
             self._open_camera()
@@ -920,24 +1028,66 @@ class MainWindow(QMainWindow):
         self.btn_roi_select.setChecked(True)
         self.preview.set_selection_enabled(True)
         self._show_roi_panel()
+        self._capture_roi_snapshot()
         self._log("ROI 框选已启用：在预览图上拖拽矩形，松开后会回填坐标，点击“应用”后生效")
 
-    def _deactivate_roi_selection(self) -> None:
+    def _deactivate_roi_selection(self, restore_full: bool = False) -> None:
+        if restore_full:
+            self._reset_sensor_roi_to_full()
         self._roi_selection_active = False
+        self.roi_enabled.setChecked(False)
         self.preview.set_selection_enabled(False)
         self.btn_roi_select.setChecked(False)
         if hasattr(self, "roi_settings_panel"):
             self.roi_settings_panel.hide()
+        if hasattr(self, "roi_snapshot"):
+            self.roi_snapshot.clear_snapshot()
 
     def _show_roi_panel(self) -> None:
-        panel = self.roi_settings_panel
-        panel.adjustSize()
-        button_pos = self.btn_roi_select.mapTo(self, self.btn_roi_select.rect().bottomLeft())
-        x = max(8, min(button_pos.x(), self.width() - panel.sizeHint().width() - 8))
-        y = max(8, button_pos.y() + 4)
-        panel.move(x, y)
-        panel.show()
-        panel.raise_()
+        self.roi_settings_panel.show()
+
+    def _capture_roi_snapshot(self) -> None:
+        if not self.camera.initialized:
+            self.roi_snapshot.clear_snapshot()
+            return
+        self._update_preview_roi_geometry_from_camera()
+        frame = self.camera.grab()
+        if frame is None:
+            self.roi_snapshot.clear_snapshot()
+            return
+        origin_x, origin_y = self._preview_origin
+        self.roi_snapshot.set_snapshot(
+            frame_to_pixmap(frame, max(self.roi_snapshot.width(), 320), max(self.roi_snapshot.height(), 220)),
+            frame.shape[1],
+            frame.shape[0],
+            origin_x,
+            origin_y,
+        )
+        self._refresh_roi_snapshot_overlay()
+
+    def _refresh_roi_snapshot_overlay(self) -> None:
+        self.roi_snapshot.set_roi(
+            self.roi_x.value(),
+            self.roi_y.value(),
+            self.roi_w.value(),
+            self.roi_h.value(),
+        )
+
+    def _reset_sensor_roi_to_full(self) -> tuple[int, int, int, int] | None:
+        if not self.camera.initialized:
+            return None
+        try:
+            x, y, width, height = self.camera.reset_sensor_roi()
+            self._set_roi_values(x, y, width, height)
+            self._preview_origin = (0, 0)
+            self.camera_status.setText(f"相机: 已连接 {self.camera.width}x{self.camera.height}")
+            self._update_preview_roi_geometry_from_camera()
+            self._invalidate_calibration("ROI 已变化")
+            self._log(f"ROI 已恢复全幅: X={x}, Y={y}, 宽={width}, 高={height}")
+            return x, y, width, height
+        except Exception as exc:
+            self._show_error("ROI 恢复全幅失败", exc)
+            return None
 
     def _apply_style(self) -> None:
         self.setStyleSheet(
@@ -995,6 +1145,14 @@ class MainWindow(QMainWindow):
                 border: 1px solid #55535b;
                 border-radius: 2px;
                 font-size: 16px;
+                font-weight: 400;
+            }
+            QLabel#roiSnapshot {
+                background: #0f1115;
+                color: #8a919b;
+                border: 1px solid #55535b;
+                border-radius: 2px;
+                font-size: 13px;
                 font-weight: 400;
             }
             QLabel#statusPill {
@@ -1364,20 +1522,26 @@ class MainWindow(QMainWindow):
         self.exposure_us.blockSignals(False)
         self.gain_x.blockSignals(False)
 
+        sensor_min_width, sensor_min_height, sensor_max_width, sensor_max_height = self._safe_roi_spin_limits(
+            roi.min_width,
+            roi.min_height,
+            roi.max_width,
+            roi.max_height,
+        )
         for spin, low, high, value in [
-            (self.roi_x, 0, roi.max_width - roi.min_width, roi.x),
-            (self.roi_y, 0, roi.max_height - roi.min_height, roi.y),
-            (self.roi_w, roi.min_width, roi.max_width, roi.width),
-            (self.roi_h, roi.min_height, roi.max_height, roi.height),
+            (self.roi_x, 0, sensor_max_width - sensor_min_width, roi.x),
+            (self.roi_y, 0, sensor_max_height - sensor_min_height, roi.y),
+            (self.roi_w, sensor_min_width, sensor_max_width, roi.width),
+            (self.roi_h, sensor_min_height, sensor_max_height, roi.height),
         ]:
             spin.blockSignals(True)
             spin.setRange(max(0, low), max(0, high))
             spin.setValue(max(spin.minimum(), min(spin.maximum(), value)))
             spin.blockSignals(False)
-        self._sensor_max_width = roi.max_width
-        self._sensor_max_height = roi.max_height
-        self._sensor_min_width = roi.min_width
-        self._sensor_min_height = roi.min_height
+        self._sensor_max_width = sensor_max_width
+        self._sensor_max_height = sensor_max_height
+        self._sensor_min_width = sensor_min_width
+        self._sensor_min_height = sensor_min_height
         self._preview_origin = (roi.x, roi.y)
         self._log(
             "相机能力: "
@@ -1405,15 +1569,37 @@ class MainWindow(QMainWindow):
                 self._preview_origin = (0, 0)
             self.camera_status.setText(f"相机: 已连接 {self.camera.width}x{self.camera.height}")
             self._update_preview_roi_geometry_from_camera()
+            self._refresh_roi_snapshot_overlay()
             self._invalidate_calibration("ROI 已变化")
             self._log(f"ROI 已应用: X={x}, Y={y}, 宽={width}, 高={height}")
         except Exception as exc:
             self._show_error("ROI 设置失败", exc)
 
+    def _safe_roi_spin_limits(
+        self,
+        min_width: int,
+        min_height: int,
+        max_width: int,
+        max_height: int,
+    ) -> tuple[int, int, int, int]:
+        max_width = max(1, int(max_width or 0))
+        max_height = max(1, int(max_height or 0))
+        min_width = max(1, min(int(min_width or 0), max_width))
+        min_height = max(1, min(int(min_height or 0), max_height))
+        return min_width, min_height, max_width, max_height
+
     def _reset_roi(self) -> None:
-        self.roi_enabled.setChecked(False)
-        self._apply_roi()
-        self._deactivate_roi_selection()
+        self._deactivate_roi_selection(restore_full=True)
+
+    def _restore_roi_full_frame(self) -> None:
+        if self._reset_sensor_roi_to_full() is None:
+            return
+        self._roi_selection_active = True
+        self.roi_enabled.setChecked(True)
+        self.btn_roi_select.setChecked(True)
+        self.preview.set_selection_enabled(True)
+        self._show_roi_panel()
+        self._capture_roi_snapshot()
 
     def _update_preview_roi_geometry(self, frame: np.ndarray) -> None:
         self._update_preview_roi_geometry_from_camera()
@@ -1434,15 +1620,22 @@ class MainWindow(QMainWindow):
         if not self._roi_selection_active:
             return
         self.roi_enabled.setChecked(True)
-        x = max(0, min(x, self._sensor_max_width - self._sensor_min_width))
-        y = max(0, min(y, self._sensor_max_height - self._sensor_min_height))
-        width = max(self._sensor_min_width, min(width, self._sensor_max_width - x))
-        height = max(self._sensor_min_height, min(height, self._sensor_max_height - y))
+        sensor_min_width, sensor_min_height, sensor_max_width, sensor_max_height = self._safe_roi_spin_limits(
+            self._sensor_min_width,
+            self._sensor_min_height,
+            self._sensor_max_width,
+            self._sensor_max_height,
+        )
+        x = max(0, min(x, sensor_max_width - sensor_min_width))
+        y = max(0, min(y, sensor_max_height - sensor_min_height))
+        width = max(sensor_min_width, min(width, sensor_max_width - x))
+        height = max(sensor_min_height, min(height, sensor_max_height - y))
         self.roi_x.setValue(x)
         self.roi_y.setValue(y)
         self.roi_w.setValue(width)
         self.roi_h.setValue(height)
         self._show_roi_panel()
+        self._capture_roi_snapshot()
         self._log(
             "ROI 坐标已回填: "
             f"X={x}, Y={y}, 宽={width}, 高={height}；点击“应用”后切换传感器 ROI"
@@ -1458,6 +1651,7 @@ class MainWindow(QMainWindow):
             spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(False)
+        self._refresh_roi_snapshot_overlay()
 
     def _anti_flick_changed(self, checked: bool) -> None:
         self.light_frequency.setEnabled(checked)
@@ -1785,6 +1979,7 @@ class MainWindow(QMainWindow):
             self.roi_w,
             self.roi_h,
             self.btn_apply_roi,
+            self.btn_restore_roi,
             self.btn_reset_roi,
             self.bit_depth,
             self.trigger_mode,
