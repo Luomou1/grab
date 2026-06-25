@@ -4,6 +4,7 @@ import cv2
 import numpy as np
 
 from grab_app.camera import CameraFrame
+import grab_app.services.scanner as scanner_module
 from grab_app.services.scanner import FlatFieldCalibration, ScanConfig, ScanWorker
 
 
@@ -62,16 +63,13 @@ class FakePzt:
         return self.position
 
 
-def test_async_save_binds_frame_copy_to_scan_sequence(tmp_path) -> None:
-    camera = FakeCamera()
-    pzt = FakePzt()
-    worker = ScanWorker(camera, pzt, lambda *_: None, lambda *_: None)
-    config = ScanConfig(
-        mode="normal",
+def _scan_config(tmp_path, mode: str = "normal", step_um: float = 1.0) -> ScanConfig:
+    return ScanConfig(
+        mode=mode,
         channel=0,
         start_um=0.0,
         end_um=2.0,
-        step_um=1.0,
+        step_um=step_um,
         stable_ms=0,
         repeats=1,
         trigger_mode="soft",
@@ -80,6 +78,33 @@ def test_async_save_binds_frame_copy_to_scan_sequence(tmp_path) -> None:
         extension="png",
         bit_depth=8,
     )
+
+
+def test_scan_folder_name_uses_mode_step_and_minute(tmp_path, monkeypatch) -> None:
+    real_datetime = scanner_module.datetime
+
+    class FixedDatetime:
+        @classmethod
+        def now(cls):
+            return real_datetime(2026, 6, 25, 16, 30, 45)
+
+    monkeypatch.setattr(scanner_module, "datetime", FixedDatetime)
+    worker = ScanWorker(FakeCamera(), FakePzt(), lambda *_: None, lambda *_: None)
+    config = _scan_config(tmp_path, mode="center", step_um=0.5)
+
+    first = worker._next_scan_folder(config)
+    first.mkdir()
+    second = worker._next_scan_folder(config)
+
+    assert first.name == "CS-0.5um-06251630"
+    assert second.name == "CS-0.5um-06251630-02"
+
+
+def test_async_save_binds_frame_copy_to_scan_sequence(tmp_path) -> None:
+    camera = FakeCamera()
+    pzt = FakePzt()
+    worker = ScanWorker(camera, pzt, lambda *_: None, lambda *_: None)
+    config = _scan_config(tmp_path)
 
     result = worker._scan(config)
 

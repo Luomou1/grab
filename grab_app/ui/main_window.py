@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 import time
 from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QSize, QObject, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QPoint, QRect, QSize, QObject, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
@@ -46,9 +47,11 @@ from grab_app.config import (
     PZT_MAX_UM,
     PZT_UDP_PORT,
 )
+from grab_app import __version__
 from grab_app.image_io import next_numbered_path
 from grab_app.pzt import PZTController
 from grab_app.services import FlatFieldCalibration, ScanConfig, ScanResult, ScanWorker
+from grab_app.update import UpdateInfo, check_latest_release
 
 
 class NoWheelComboBox(QComboBox):
@@ -142,6 +145,12 @@ def tool_icon(kind: str) -> QIcon:
         painter.drawLine(8, 8, 16, 8)
         painter.drawLine(8, 12, 16, 12)
         painter.drawLine(8, 16, 14, 16)
+    elif kind == "update":
+        painter.drawArc(5, 5, 14, 14, 35 * 16, 285 * 16)
+        painter.drawLine(15, 4, 19, 5)
+        painter.drawLine(19, 5, 18, 9)
+        painter.drawLine(9, 20, 5, 19)
+        painter.drawLine(5, 19, 6, 15)
 
     painter.end()
     return QIcon(pixmap)
@@ -151,6 +160,7 @@ class UiBridge(QObject):
     progress = Signal(str, int, int, float, object)
     done = Signal(object, object)
     log = Signal(str)
+    update_checked = Signal(object, object)
 
 
 class CollapsibleSection(QFrame):
@@ -413,6 +423,7 @@ class MainWindow(QMainWindow):
         self.bridge.progress.connect(self._on_scan_progress)
         self.bridge.done.connect(self._on_scan_done)
         self.bridge.log.connect(self._append_log)
+        self.bridge.update_checked.connect(self._on_update_checked)
 
         self._build_ui()
         self._apply_style()
@@ -482,6 +493,8 @@ class MainWindow(QMainWindow):
             )
         )
         top_bar_layout.addWidget(self._settings_button("运行日志", self.log_dialog, "log"))
+        self.btn_check_update = self._action_button("检查更新", "update", self._check_updates)
+        top_bar_layout.addWidget(self.btn_check_update)
         top_bar_layout.addSpacing(10)
         top_bar_layout.addWidget(self.camera_status)
         top_bar_layout.addWidget(self.pzt_status)
@@ -1405,6 +1418,50 @@ class MainWindow(QMainWindow):
             }
             """
         )
+
+    def _check_updates(self) -> None:
+        self.btn_check_update.setEnabled(False)
+        self._log(f"正在检查更新，当前版本 v{__version__} ...")
+
+        def worker() -> None:
+            try:
+                result = check_latest_release(__version__)
+                self.bridge.update_checked.emit(result, None)
+            except Exception as exc:
+                self.bridge.update_checked.emit(None, exc)
+
+        threading.Thread(target=worker, name="update-checker", daemon=True).start()
+
+    def _on_update_checked(self, result: object, exc: object) -> None:
+        self.btn_check_update.setEnabled(True)
+        if exc is not None:
+            message = str(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            self._append_log(message)
+            QMessageBox.warning(self, "检查更新失败", message)
+            return
+        update = result if isinstance(result, UpdateInfo) else None
+        if update is None:
+            return
+        self._append_log(f"检查更新完成: 当前 v{update.current_version}，最新 {update.latest_version}")
+        if not update.is_newer:
+            QMessageBox.information(self, "检查更新", f"当前已是最新版本: v{update.current_version}")
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setWindowTitle("发现新版本")
+        dialog.setText(f"发现新版本 {update.latest_version}，当前版本 v{update.current_version}。")
+        dialog.setInformativeText("是否打开 GitHub 下载页面？安装新版本会覆盖旧版本配置。")
+        dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        dialog.setDefaultButton(QMessageBox.Yes)
+        yes_button = dialog.button(QMessageBox.Yes)
+        no_button = dialog.button(QMessageBox.No)
+        if yes_button is not None:
+            yes_button.setText("打开下载")
+        if no_button is not None:
+            no_button.setText("稍后")
+        if dialog.exec() == QMessageBox.Yes:
+            QDesktopServices.openUrl(QUrl(update.download_url))
 
     def _open_camera(self) -> None:
         try:

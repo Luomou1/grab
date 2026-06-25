@@ -138,8 +138,7 @@ class ScanWorker:
 
     def _scan(self, config: ScanConfig) -> ScanResult:
         self._validate(config)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        scan_folder = config.save_dir / f"{'CenterScan' if config.mode == 'center' else 'Scan'}_{stamp}"
+        scan_folder = self._next_scan_folder(config)
         scan_folder.mkdir(parents=True, exist_ok=False)
 
         if config.bit_depth == 8:
@@ -290,6 +289,21 @@ class ScanWorker:
             raise ValueError("起始位置和终止位置不能相同")
         if config.start_um < PZT_MIN_UM or config.end_um > PZT_MAX_UM:
             raise ValueError("扫描范围超出 PZT 限制(0-270um)")
+
+    def _next_scan_folder(self, config: ScanConfig) -> Path:
+        base_name = self._scan_folder_name(config)
+        candidate = config.save_dir / base_name
+        index = 2
+        while candidate.exists():
+            candidate = config.save_dir / f"{base_name}-{index:02d}"
+            index += 1
+        return candidate
+
+    def _scan_folder_name(self, config: ScanConfig) -> str:
+        mode_name = "CS" if config.mode == "center" else "Scan"
+        step_text = f"{config.step_um:g}um"
+        stamp = datetime.now().strftime("%m%d%H%M")
+        return f"{mode_name}-{step_text}-{stamp}"
 
     def _positions(self, start: float, end: float, step: float) -> list[float]:
         sign = 1 if end >= start else -1

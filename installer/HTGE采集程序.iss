@@ -1,5 +1,5 @@
 #define MyAppName "HTGE采集程序"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "HTGE"
 #define MyAppExeName "HTGE采集程序.exe"
 
