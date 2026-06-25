@@ -27,7 +27,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
-    QProgressDialog,
     QPushButton,
     QRubberBand,
     QScrollArea,
@@ -192,6 +191,109 @@ class CollapsibleSection(QFrame):
     def _set_expanded(self, expanded: bool) -> None:
         self.toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
         self.content.setVisible(expanded)
+
+
+class UpdateProgressDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("updateProgressDialog")
+        self.setWindowTitle("在线更新")
+        self.setModal(True)
+        self.setFixedSize(420, 188)
+        self.setStyleSheet(
+            """
+            QDialog#updateProgressDialog {
+                background: #302d35;
+                color: #e9eeee;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogIcon {
+                background: #16d6d0;
+                border-radius: 6px;
+                padding: 3px;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogTitle {
+                color: #f3f5f6;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogStatus {
+                color: #cfd6dc;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogDetail {
+                color: #16d6d0;
+                font-size: 12px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+            QProgressBar#updateProgress {
+                min-height: 12px;
+                max-height: 12px;
+                border: 1px solid #69636f;
+                border-radius: 3px;
+                background: #24232a;
+            }
+            QProgressBar#updateProgress::chunk {
+                background: #16d6d0;
+                border-radius: 2px;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 18, 22, 20)
+        layout.setSpacing(12)
+
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(10)
+
+        icon = QLabel()
+        icon.setObjectName("updateDialogIcon")
+        icon.setFixedSize(28, 28)
+        icon.setAlignment(Qt.AlignCenter)
+        icon.setPixmap(tool_icon("update").pixmap(22, 22))
+
+        title = QLabel("正在更新")
+        title.setObjectName("updateDialogTitle")
+        title_row.addWidget(icon)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+
+        self.status_label = QLabel("正在下载安装包...")
+        self.status_label.setObjectName("updateDialogStatus")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setObjectName("updateProgress")
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(12)
+        layout.addWidget(self.progress)
+
+        self.detail_label = QLabel("0%")
+        self.detail_label.setObjectName("updateDialogDetail")
+        self.detail_label.setAlignment(Qt.AlignRight)
+        layout.addWidget(self.detail_label)
+
+    def set_progress(self, received: int, total: int) -> None:
+        if total > 0:
+            percent = min(100, max(0, round(received * 100 / total)))
+            self.progress.setRange(0, 100)
+            self.progress.setValue(percent)
+            self.status_label.setText(
+                f"正在下载安装包... {received / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB"
+            )
+            self.detail_label.setText(f"{percent}%")
+        else:
+            self.progress.setRange(0, 0)
+            self.status_label.setText(f"正在下载安装包... {received / 1024 / 1024:.1f} MB")
+            self.detail_label.setText("下载中")
 
 
 class RoiPreviewLabel(QLabel):
@@ -424,7 +526,7 @@ class MainWindow(QMainWindow):
         self._sensor_max_height = 1024
         self._sensor_min_width = 1
         self._sensor_min_height = 1
-        self._update_progress_dialog: QProgressDialog | None = None
+        self._update_progress_dialog: UpdateProgressDialog | None = None
 
         self.bridge.progress.connect(self._on_scan_progress)
         self.bridge.done.connect(self._on_scan_done)
@@ -1401,6 +1503,43 @@ class MainWindow(QMainWindow):
                 border-radius: 2px;
                 background: #34313a;
             }
+            QDialog#updateProgressDialog {
+                background: #302d35;
+                color: #e9eeee;
+                font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogIcon {
+                background: #16d6d0;
+                border-radius: 6px;
+                padding: 3px;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogTitle {
+                color: #f3f5f6;
+                font-size: 18px;
+                font-weight: 700;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogStatus {
+                color: #cfd6dc;
+                font-size: 13px;
+                font-weight: 500;
+            }
+            QDialog#updateProgressDialog QLabel#updateDialogDetail {
+                color: #16d6d0;
+                font-size: 12px;
+                font-weight: 700;
+                font-variant-numeric: tabular-nums;
+            }
+            QProgressBar#updateProgress {
+                min-height: 12px;
+                max-height: 12px;
+                border: 1px solid #69636f;
+                border-radius: 3px;
+                background: #24232a;
+            }
+            QProgressBar#updateProgress::chunk {
+                background: #16d6d0;
+                border-radius: 2px;
+            }
             QMessageBox {
                 background: #f6f7f9;
             }
@@ -1475,13 +1614,9 @@ class MainWindow(QMainWindow):
 
     def _download_update(self, update: UpdateInfo) -> None:
         self.btn_check_update.setEnabled(False)
-        self._update_progress_dialog = QProgressDialog("正在下载安装包...", "取消", 0, 100, self)
-        self._update_progress_dialog.setWindowTitle("在线更新")
-        self._update_progress_dialog.setWindowModality(Qt.WindowModal)
-        self._update_progress_dialog.setCancelButton(None)
-        self._update_progress_dialog.setMinimumDuration(0)
-        self._update_progress_dialog.setValue(0)
+        self._update_progress_dialog = UpdateProgressDialog(self)
         self._update_progress_dialog.show()
+        enable_dark_title_bar(self._update_progress_dialog)
 
         def worker() -> None:
             try:
@@ -1499,13 +1634,7 @@ class MainWindow(QMainWindow):
         dialog = self._update_progress_dialog
         if dialog is None:
             return
-        if total > 0:
-            dialog.setMaximum(total)
-            dialog.setValue(min(received, total))
-            dialog.setLabelText(f"正在下载安装包... {received / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB")
-        else:
-            dialog.setMaximum(0)
-            dialog.setLabelText(f"正在下载安装包... {received / 1024 / 1024:.1f} MB")
+        dialog.set_progress(received, total)
 
     def _on_update_downloaded(self, path: object, exc: object) -> None:
         self.btn_check_update.setEnabled(True)
