@@ -1,6 +1,7 @@
 param(
     [switch]$InstallDeps,
     [switch]$SkipInstaller,
+    [switch]$CleanInstallersOnly,
     [switch]$NoVendorSdk,
     [string]$SdkX64Path = "D:\HuaTengVision\SDK\X64",
     [string]$InnoSetupCompiler = ""
@@ -8,14 +9,86 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Get-InnoDefine {
+    param(
+        [string[]]$Lines,
+        [string]$Name
+    )
+
+    $match = $Lines | Select-String -Pattern "^\s*#define\s+$Name\s+`"([^`"]+)`"" | Select-Object -First 1
+    if (-not $match) {
+        throw "Inno Setup define not found: $Name"
+    }
+
+    return $match.Matches[0].Groups[1].Value
+}
+
+function Get-InnoSetting {
+    param(
+        [string[]]$Lines,
+        [string]$Name
+    )
+
+    $match = $Lines | Select-String -Pattern "^\s*$Name=(.+)\s*$" | Select-Object -First 1
+    if (-not $match) {
+        throw "Inno Setup setting not found: $Name"
+    }
+
+    return $match.Matches[0].Groups[1].Value.Trim()
+}
+
+function Clear-OldInstallers {
+    param(
+        [string]$ReleaseDir,
+        [string]$CurrentInstallerName,
+        [string]$InstallerFilter
+    )
+
+    if (-not (Test-Path -LiteralPath $ReleaseDir)) {
+        Write-Host "Release directory does not exist: $ReleaseDir"
+        return
+    }
+
+    $releaseRoot = (Resolve-Path -LiteralPath $ReleaseDir).Path
+    $currentInstallerPath = Join-Path $ReleaseDir $CurrentInstallerName
+    if (-not (Test-Path -LiteralPath $currentInstallerPath)) {
+        throw "Current installer was not found: $currentInstallerPath"
+    }
+
+    $currentResolvedPath = (Resolve-Path -LiteralPath $currentInstallerPath).Path
+    $oldInstallers = Get-ChildItem -LiteralPath $ReleaseDir -File -Filter $InstallerFilter |
+        Where-Object { (Resolve-Path -LiteralPath $_.FullName).Path -ne $currentResolvedPath }
+
+    foreach ($installer in $oldInstallers) {
+        $targetPath = (Resolve-Path -LiteralPath $installer.FullName).Path
+        if ([System.IO.Path]::GetDirectoryName($targetPath) -ne $releaseRoot) {
+            throw "Refusing to remove installer outside release directory: $targetPath"
+        }
+
+        Remove-Item -LiteralPath $targetPath -Force
+        Write-Host "Removed old installer: $($installer.Name)"
+    }
+}
+
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Resolve-Path (Join-Path $ScriptDir "..")
 $SpecPath = (Get-ChildItem -Path (Join-Path $ProjectRoot "packaging") -Filter "*.spec" | Select-Object -First 1).FullName
 $IssPath = (Get-ChildItem -Path (Join-Path $ProjectRoot "installer") -Filter "*.iss" | Select-Object -First 1).FullName
 $DistRoot = Join-Path $ProjectRoot "dist"
 $ReleaseDir = Join-Path $ProjectRoot "release"
+$IssLines = Get-Content -LiteralPath $IssPath
+$AppVersion = Get-InnoDefine -Lines $IssLines -Name "MyAppVersion"
+$OutputBaseFilename = Get-InnoSetting -Lines $IssLines -Name "OutputBaseFilename"
+$CurrentInstallerName = ($OutputBaseFilename -replace "\{#MyAppVersion\}", $AppVersion) + ".exe"
+$InstallerFilter = ($OutputBaseFilename -replace "\{#MyAppVersion\}", "*") + ".exe"
 
 Set-Location $ProjectRoot
+
+if ($CleanInstallersOnly) {
+    Clear-OldInstallers -ReleaseDir $ReleaseDir -CurrentInstallerName $CurrentInstallerName -InstallerFilter $InstallerFilter
+    Write-Host "Current installer kept: $CurrentInstallerName"
+    exit 0
+}
 
 if ($InstallDeps) {
     python -m pip install -r requirements.txt
@@ -81,5 +154,10 @@ if (-not $InnoSetupCompiler -or -not (Test-Path $InnoSetupCompiler)) {
 }
 
 & $InnoSetupCompiler $IssPath
+if ($LASTEXITCODE -ne 0) {
+    throw "Inno Setup failed with exit code $LASTEXITCODE"
+}
+
+Clear-OldInstallers -ReleaseDir $ReleaseDir -CurrentInstallerName $CurrentInstallerName -InstallerFilter $InstallerFilter
 
 Write-Host "Installer output directory: $ReleaseDir"
