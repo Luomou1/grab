@@ -8,6 +8,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 project_root = Path(SPECPATH).parent
 app_name = "grab"
+icon_path = project_root / "packaging" / "assets" / "grab.ico"
 
 sdk_binaries = []
 if os.environ.get("HTGE_INCLUDE_SDK", "1") != "0":
@@ -20,6 +21,8 @@ datas = []
 readme = project_root / "README.md"
 if readme.exists():
     datas.append((str(readme), "."))
+if icon_path.exists():
+    datas.append((str(icon_path), "assets"))
 
 
 a = Analysis(
@@ -53,6 +56,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(icon_path),
 )
 
 coll = COLLECT(

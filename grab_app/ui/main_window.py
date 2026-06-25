@@ -48,6 +48,7 @@ from grab_app.config import (
     PZT_DEFAULT_IP,
     PZT_MAX_UM,
     PZT_UDP_PORT,
+    app_icon_path,
 )
 from grab_app import __version__
 from grab_app.image_io import next_numbered_path
@@ -499,6 +500,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon(str(app_icon_path())))
         self.resize(1500, 920)
         self.setMinimumSize(1080, 680)
 

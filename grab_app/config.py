@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,6 +14,18 @@ PZT_DEFAULT_BAUD = 115200
 PZT_BAUD_RATES = (9600, 19200, 38400, 57600, 115200)
 PZT_UDP_PORT = 7010
 PZT_DEFAULT_IP = "192.168.0.100"
+
+
+def app_icon_path() -> Path:
+    bundle_root = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+    candidates = (
+        bundle_root / "assets" / "grab.ico",
+        Path(__file__).resolve().parents[1] / "packaging" / "assets" / "grab.ico",
+    )
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[-1]
 
 
 @dataclass(frozen=True)

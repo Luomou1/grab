@@ -1,5 +1,5 @@
 #define MyAppName "grab"
-#define MyAppVersion "1.2.2"
+#define MyAppVersion "1.2.3"
 #define MyAppPublisher "grab"
 #define MyAppExeName "grab.exe"
 
@@ -20,6 +20,7 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 PrivilegesRequired=lowest
 SetupLogging=yes
+SetupIconFile=..\packaging\assets\grab.ico
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
