@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import json
-import shutil
 import re
+import shutil
 import subprocess
 import tempfile
 import urllib.request
@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 LATEST_RELEASE_API = "https://api.github.com/repos/Luomou1/grab/releases/latest"
 LATEST_RELEASE_PAGE = "https://github.com/Luomou1/grab/releases/latest"
+UPDATE_CACHE_DIR = Path(tempfile.gettempdir()) / "grab-updates"
 
 
 @dataclass(frozen=True)
@@ -91,7 +92,7 @@ def download_installer(
     progress: ProgressCallback | None = None,
     timeout: float = 20.0,
 ) -> Path:
-    target_dir = Path(tempfile.gettempdir()) / "grab-updates" / update.latest_version.lstrip("v")
+    target_dir = UPDATE_CACHE_DIR / update.latest_version.lstrip("v")
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / _safe_filename(update.asset_name or _filename_from_url(update.download_url))
     partial = target.with_suffix(target.suffix + ".part")
@@ -137,6 +138,20 @@ def start_installer(installer_path: Path) -> None:
         ],
         close_fds=True,
     )
+
+
+def cleanup_update_cache(current_version: str, cache_dir: Path = UPDATE_CACHE_DIR) -> None:
+    if not cache_dir.exists():
+        return
+    keep_dir_name = current_version.lstrip("v")
+    for path in cache_dir.iterdir():
+        try:
+            if path.is_file() and path.suffix == ".part":
+                path.unlink(missing_ok=True)
+            elif path.is_dir() and path.name != keep_dir_name:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def _verify_digest(path: Path, digest: str) -> None:
