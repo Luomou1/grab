@@ -1,5 +1,5 @@
 #define MyAppName "grab"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyAppPublisher "grab"
 #define MyAppExeName "grab.exe"
 
