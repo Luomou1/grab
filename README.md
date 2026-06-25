@@ -11,8 +11,8 @@ Windows x64 用户可从 [GitHub Releases](https://github.com/Luomou1/grab/relea
 当前版本：`v1.1.0`
 
 ```text
-HTGE采集程序_Setup_v1.1.0.exe
-SHA256: EA4173B30DA7DDCBCC04B896B5E9FE69A9869A2E5F9F1E24CB6782E0DA9BA26A
+HTGE_Acquisition_Setup_v1.1.0.exe
+SHA256: FF7AFF3A58A8C34C03C3AB37DEA257BC58554C8D409BB8E23B015FAAB14EE99B
 ```
 
 安装包已包含 Python 运行环境及华腾 SDK 核心 DLL，无需单独安装 Python。目标电脑仍需安装与相机型号匹配的华腾驱动；GigE 相机还需正确配置网卡和防火墙。
@@ -82,7 +82,7 @@ python run_app.py
 输出目录：
 
 ```text
-release\HTGE采集程序_Setup_v1.1.0.exe
+release\HTGE_Acquisition_Setup_v1.1.0.exe
 ```
 
 详细说明见 [docs/打包安装包.md](docs/打包安装包.md)。
