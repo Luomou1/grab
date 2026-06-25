@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_submodules
 
 
 project_root = Path(SPECPATH).parent
-app_name = "HTGE采集程序"
+app_name = "grab"
 
 sdk_binaries = []
 if os.environ.get("HTGE_INCLUDE_SDK", "1") != "0":

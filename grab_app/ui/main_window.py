@@ -8,10 +8,11 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QSize, QObject, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QPoint, QRect, QSize, QObject, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QRubberBand,
     QScrollArea,
@@ -42,6 +44,7 @@ from PySide6.QtWidgets import (
 from grab_app.camera import CameraController
 from grab_app.config import (
     PZT_BAUD_RATES,
+    APP_NAME,
     PZT_DEFAULT_BAUD,
     PZT_DEFAULT_IP,
     PZT_MAX_UM,
@@ -51,7 +54,7 @@ from grab_app import __version__
 from grab_app.image_io import next_numbered_path
 from grab_app.pzt import PZTController
 from grab_app.services import FlatFieldCalibration, ScanConfig, ScanResult, ScanWorker
-from grab_app.update import UpdateInfo, check_latest_release
+from grab_app.update import UpdateInfo, check_latest_release, download_installer, start_installer
 
 
 class NoWheelComboBox(QComboBox):
@@ -161,6 +164,8 @@ class UiBridge(QObject):
     done = Signal(object, object)
     log = Signal(str)
     update_checked = Signal(object, object)
+    update_download_progress = Signal(int, int)
+    update_downloaded = Signal(object, object)
 
 
 class CollapsibleSection(QFrame):
@@ -391,7 +396,7 @@ def frame_to_pixmap(frame: np.ndarray, width: int, height: int) -> QPixmap:
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("采集程序")
+        self.setWindowTitle(APP_NAME)
         self.resize(1500, 920)
         self.setMinimumSize(1080, 680)
 
@@ -419,11 +424,14 @@ class MainWindow(QMainWindow):
         self._sensor_max_height = 1024
         self._sensor_min_width = 1
         self._sensor_min_height = 1
+        self._update_progress_dialog: QProgressDialog | None = None
 
         self.bridge.progress.connect(self._on_scan_progress)
         self.bridge.done.connect(self._on_scan_done)
         self.bridge.log.connect(self._append_log)
         self.bridge.update_checked.connect(self._on_update_checked)
+        self.bridge.update_download_progress.connect(self._on_update_download_progress)
+        self.bridge.update_downloaded.connect(self._on_update_downloaded)
 
         self._build_ui()
         self._apply_style()
@@ -1451,17 +1459,75 @@ class MainWindow(QMainWindow):
         dialog.setIcon(QMessageBox.Information)
         dialog.setWindowTitle("发现新版本")
         dialog.setText(f"发现新版本 {update.latest_version}，当前版本 v{update.current_version}。")
-        dialog.setInformativeText("是否打开 GitHub 下载页面？安装新版本会覆盖旧版本配置。")
+        dialog.setInformativeText("点击“立即更新”后会在后台下载安装包，下载完成后自动启动安装器并退出当前程序。")
+        if update.release_notes:
+            dialog.setDetailedText(update.release_notes[:4000])
         dialog.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         dialog.setDefaultButton(QMessageBox.Yes)
         yes_button = dialog.button(QMessageBox.Yes)
         no_button = dialog.button(QMessageBox.No)
         if yes_button is not None:
-            yes_button.setText("打开下载")
+            yes_button.setText("立即更新")
         if no_button is not None:
             no_button.setText("稍后")
         if dialog.exec() == QMessageBox.Yes:
-            QDesktopServices.openUrl(QUrl(update.download_url))
+            self._download_update(update)
+
+    def _download_update(self, update: UpdateInfo) -> None:
+        self.btn_check_update.setEnabled(False)
+        self._update_progress_dialog = QProgressDialog("正在下载安装包...", "取消", 0, 100, self)
+        self._update_progress_dialog.setWindowTitle("在线更新")
+        self._update_progress_dialog.setWindowModality(Qt.WindowModal)
+        self._update_progress_dialog.setCancelButton(None)
+        self._update_progress_dialog.setMinimumDuration(0)
+        self._update_progress_dialog.setValue(0)
+        self._update_progress_dialog.show()
+
+        def worker() -> None:
+            try:
+                path = download_installer(
+                    update,
+                    progress=lambda received, total: self.bridge.update_download_progress.emit(received, total),
+                )
+                self.bridge.update_downloaded.emit(path, None)
+            except Exception as exc:
+                self.bridge.update_downloaded.emit(None, exc)
+
+        threading.Thread(target=worker, name="update-downloader", daemon=True).start()
+
+    def _on_update_download_progress(self, received: int, total: int) -> None:
+        dialog = self._update_progress_dialog
+        if dialog is None:
+            return
+        if total > 0:
+            dialog.setMaximum(total)
+            dialog.setValue(min(received, total))
+            dialog.setLabelText(f"正在下载安装包... {received / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB")
+        else:
+            dialog.setMaximum(0)
+            dialog.setLabelText(f"正在下载安装包... {received / 1024 / 1024:.1f} MB")
+
+    def _on_update_downloaded(self, path: object, exc: object) -> None:
+        self.btn_check_update.setEnabled(True)
+        if self._update_progress_dialog is not None:
+            self._update_progress_dialog.close()
+            self._update_progress_dialog = None
+        if exc is not None:
+            message = str(exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            self._append_log(message)
+            QMessageBox.warning(self, "在线更新失败", message)
+            return
+        installer_path = Path(str(path))
+        self._append_log(f"安装包下载完成: {installer_path}")
+        QMessageBox.information(self, "在线更新", "安装包已下载完成。程序将退出并启动安装器。")
+        try:
+            start_installer(installer_path)
+        except Exception as start_exc:
+            self._show_error("启动安装器失败", start_exc)
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     def _open_camera(self) -> None:
         try:

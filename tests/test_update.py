@@ -13,7 +13,7 @@ def test_first_installer_url_picks_exe_asset() -> None:
         "assets": [
             {"name": "notes.txt", "browser_download_url": "https://example.invalid/notes.txt"},
             {
-                "name": "HTGE采集程序_Setup_v1.1.0.exe",
+                "name": "grab_Setup_v1.2.0.exe",
                 "browser_download_url": "https://example.invalid/setup.exe",
             },
         ]

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-APP_NAME = "HTGE + PZT 采集程序"
+APP_NAME = "grab"
 PZT_ADDRESS = 0x01
 PZT_CHANNELS = (0, 1, 2)
 PZT_MIN_UM = 0.0
@@ -23,4 +23,3 @@ class CameraSdkPaths:
 
     def existing(self) -> list[Path]:
         return [path for path in (self.vendor_x64, self.vendor_root, self.local_camera) if path.exists()]
-

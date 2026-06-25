@@ -1,7 +1,7 @@
-#define MyAppName "HTGE采集程序"
-#define MyAppVersion "1.1.0"
-#define MyAppPublisher "HTGE"
-#define MyAppExeName "HTGE采集程序.exe"
+#define MyAppName "grab"
+#define MyAppVersion "1.2.0"
+#define MyAppPublisher "grab"
+#define MyAppExeName "grab.exe"
 
 [Setup]
 AppId={{8B30D7B6-763D-4CC3-9DC9-56556A5528B1}
@@ -12,7 +12,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=..\release
-OutputBaseFilename=HTGE_Acquisition_Setup_v{#MyAppVersion}
+OutputBaseFilename=grab_Setup_v{#MyAppVersion}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -28,7 +28,7 @@ Name: "chinesesimp"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加任务："; Flags: unchecked
 
 [Files]
-Source: "..\dist\HTGE采集程序\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\grab\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\docs\打包安装包.md"; DestDir: "{app}"; Flags: ignoreversion
 
