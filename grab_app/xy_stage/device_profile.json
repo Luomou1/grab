@@ -1,0 +1,33 @@
+{
+  "name": "FMC01-02H + FMSXY100-20-20",
+  "baudrate": 38400,
+  "poll_interval_ms": 200,
+  "axes": [
+    {
+      "axis": 0,
+      "name": "X",
+      "units": 50000.0,
+      "accel": 100.0,
+      "decel": 100.0,
+      "home_speed": 3.0,
+      "home_offset": 0.0,
+      "min_position": 0.0,
+      "max_position": 20.0,
+      "max_speed": 5.0,
+      "default_speed": 0.5
+    },
+    {
+      "axis": 1,
+      "name": "Y",
+      "units": 50000.0,
+      "accel": 100.0,
+      "decel": 100.0,
+      "home_speed": 3.0,
+      "home_offset": 0.0,
+      "min_position": 0.0,
+      "max_position": 20.0,
+      "max_speed": 5.0,
+      "default_speed": 0.5
+    }
+  ]
+}

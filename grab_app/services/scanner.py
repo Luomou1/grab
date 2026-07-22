@@ -129,6 +129,22 @@ class ScanWorker:
     def stop(self) -> None:
         self._stop.set()
 
+    def run_sync(self, config: ScanConfig) -> ScanResult:
+        """在调用方工作线程中执行一次扫描。
+
+        空间扫描总控需要在每个 XY 瓦片位置串行执行完整 PZT 扫描，
+        因此不能再为每个瓦片创建一层后台线程。本入口保留原有停止事件、
+        保存队列和异常语义，同时拒绝与普通扫描并发运行。
+        """
+        if self.running:
+            raise RuntimeError("扫描已在运行")
+        self._stop.clear()
+        return self._scan(config)
+
+    def save_frame(self, path: Path, frame: np.ndarray, bit_depth: int) -> None:
+        """保存单帧并沿用扫描任务的位深与格式校验。"""
+        self._save_frame(path, frame, bit_depth)
+
     def _run(self, config: ScanConfig, done: Callable[[ScanResult | None, Exception | None], None]) -> None:
         try:
             result = self._scan(config)

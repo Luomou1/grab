@@ -41,6 +41,7 @@ class CameraHealth:
     capture_count: int
     sdk_error_count: int
     timeout_count: int
+    trigger_wait_count: int
     last_error: str
     latest_frame_age_ms: float | None
     sdk_total_frames: int | None = None
@@ -130,6 +131,8 @@ class CameraController:
         self.last_error: str = ""
         self.sdk_error_count = 0
         self.timeout_count = 0
+        self.trigger_wait_count = 0
+        self.current_trigger_mode = 0
         self.latest_frame_time: float | None = None
 
     @property
@@ -220,15 +223,26 @@ class CameraController:
                         frame_contrast=int(getattr(frame_head, "iContrast", -1)),
                     )
             except self._mvsdk.CameraException as exc:
-                self.last_error = str(exc)
-                self.sdk_error_count += 1
-                if getattr(exc, "error_code", None) == getattr(self._mvsdk, "CAMERA_STATUS_TIME_OUT", None):
-                    self.timeout_count += 1
+                self._record_grab_exception(exc)
                 time.sleep(0.001)
             except Exception as exc:
                 self.last_error = str(exc)
                 self.sdk_error_count += 1
                 time.sleep(0.01)
+
+    def _record_grab_exception(self, exc: Exception) -> None:
+        is_timeout = (
+            getattr(exc, "error_code", None)
+            == getattr(self._mvsdk, "CAMERA_STATUS_TIME_OUT", None)
+        )
+        if is_timeout and self.current_trigger_mode == 1:
+            # 触发模式下两次触发之间没有图像是正常等待，不应作为故障超时。
+            self.trigger_wait_count += 1
+            return
+        self.last_error = str(exc)
+        self.sdk_error_count += 1
+        if is_timeout:
+            self.timeout_count += 1
 
     def grab(self) -> np.ndarray | None:
         with self._frame_lock:
@@ -291,6 +305,14 @@ class CameraController:
         with self._frame_lock:
             self.capture_count = 0
 
+    def reset_timeout_counters(self) -> None:
+        """开始新的预览/触发会话时清零分模式超时统计。"""
+        with self._frame_lock:
+            self.timeout_count = 0
+            self.trigger_wait_count = 0
+            if "timeout" in self.last_error.lower() or "超时" in self.last_error:
+                self.last_error = ""
+
     def set_output_format_8bit(self) -> None:
         with self._control_lock:
             self._set_media_type(self._mvsdk.CAMERA_MEDIA_TYPE_MONO8)
@@ -318,13 +340,18 @@ class CameraController:
             self._mvsdk.CameraSetFrameSpeed(self.h_camera, int(speed))
 
     def set_trigger_mode(self, mode: int) -> None:
+        mode = int(mode)
+        changed = mode != self.current_trigger_mode
         with self._control_lock:
-            self._mvsdk.CameraSetTriggerMode(self.h_camera, int(mode))
-            if int(mode) == 1:
+            self._mvsdk.CameraSetTriggerMode(self.h_camera, mode)
+            if mode == 1:
                 try:
                     self._mvsdk.CameraSetTriggerCount(self.h_camera, 1)
                 except Exception:
                     pass
+            self.current_trigger_mode = mode
+        if changed:
+            self.reset_timeout_counters()
 
     def set_auto_exposure(self, enabled: bool) -> None:
         with self._control_lock:
@@ -666,6 +693,7 @@ class CameraController:
                 capture_count=self.capture_count,
                 sdk_error_count=self.sdk_error_count,
                 timeout_count=self.timeout_count,
+                trigger_wait_count=self.trigger_wait_count,
                 last_error=self.last_error,
                 latest_frame_age_ms=age_ms,
                 sdk_total_frames=None if stat is None else stat.total,

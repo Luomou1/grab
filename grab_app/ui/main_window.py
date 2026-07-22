@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import sys
 import threading
 import time
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QPoint, QRect, QSize, QObject, QSettings, QTimer, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QSize, QObject, QSettings, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -53,8 +54,34 @@ from grab_app.config import (
 from grab_app import __version__
 from grab_app.image_io import next_numbered_path
 from grab_app.pzt import PZTController
-from grab_app.services import FlatFieldCalibration, ScanConfig, ScanResult, ScanWorker
+from grab_app.services import (
+    FlatFieldCalibration,
+    ScanConfig,
+    ScanResult,
+    ScanWorker,
+    SpatialAcquisitionConfig,
+    SpatialScanResult,
+    SpatialScanWorker,
+    SurveyConfig,
+)
+from grab_app.spatial import (
+    MosaicComposer,
+    SafetyLimits,
+    SpatialJobStorage,
+    SpatialRect,
+    TilePlan,
+    default_calibration,
+    estimate_adjacent_translation,
+    fit_affine_calibration,
+    plan_center_scan,
+    plan_tiles,
+)
+from grab_app.ui.spatial_map import SpatialMapWidget, SpatialTile
+from grab_app.ui.xy_stage_dialog import XYStageControlDialog
+from grab_app.xy_stage import XYStageExecutor
 from grab_app.update import UpdateInfo, check_latest_release, download_installer, start_installer
+
+from .status_lamp import StatusLamp
 
 
 class NoWheelComboBox(QComboBox):
@@ -70,6 +97,11 @@ class NoWheelSpinBox(QSpinBox):
 class NoWheelDoubleSpinBox(QDoubleSpinBox):
     def wheelEvent(self, event: QWheelEvent) -> None:
         event.ignore()
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802 - Qt API
+        """保留输入精度，但显示时去掉无意义的末尾 0。"""
+        text = f"{float(value):.{self.decimals()}f}"
+        return text.rstrip("0").rstrip(".") if "." in text else text
 
 
 THEME_LABELS = {
@@ -97,7 +129,7 @@ class DeviceStatusLabel(QLabel):
     def setText(self, text: str) -> None:
         self._raw_text = text
         online = "未连接" not in text and "失败" not in text
-        display_text = text.replace("相机:", "相机").replace("PZT:", "PZT")
+        display_text = text.replace("相机:", "相机").replace("PZT:", "PZT").replace("XY:", "XY")
         dot_color = self._online_color if online else self._offline_color
         super().setText(
             f'<span style="color:{dot_color};">●</span>'
@@ -160,6 +192,14 @@ def tool_icon(kind: str, color: str = "#e6e6e8") -> QIcon:
         painter.drawLine(8, 16, 12, 20)
         painter.drawLine(16, 16, 12, 20)
         painter.drawLine(5, 12, 19, 12)
+    elif kind == "xy":
+        painter.drawRect(4, 5, 16, 14)
+        painter.drawLine(7, 16, 17, 16)
+        painter.drawLine(14, 13, 17, 16)
+        painter.drawLine(14, 19, 17, 16)
+        painter.drawLine(7, 16, 7, 8)
+        painter.drawLine(4, 11, 7, 8)
+        painter.drawLine(10, 11, 7, 8)
     elif kind == "log":
         painter.drawRoundedRect(5, 3, 14, 18, 1, 1)
         painter.drawLine(8, 8, 16, 8)
@@ -197,6 +237,10 @@ class UiBridge(QObject):
     update_checked = Signal(object, object)
     update_download_progress = Signal(int, int)
     update_downloaded = Signal(object, object)
+    spatial_progress = Signal(str, int, int, object)
+    spatial_tile = Signal(object, object, object)
+    spatial_done = Signal(object, object)
+    spatial_calibrated = Signal(object, object)
 
 
 class CollapsibleSection(QFrame):
@@ -507,6 +551,9 @@ class MainWindow(QMainWindow):
         self.status_timer = QTimer(self)
         self.status_timer.setInterval(500)
         self.status_timer.timeout.connect(self._update_camera_status_readbacks)
+        self.xy_status_timer = QTimer(self)
+        self.xy_status_timer.setInterval(200)
+        self.xy_status_timer.timeout.connect(self._update_xy_status_readback)
         self.monitor_timer = QTimer(self)
         self.monitor_timer.setInterval(500)
         self.monitor_timer.timeout.connect(self._monitor_pzt)
@@ -522,6 +569,18 @@ class MainWindow(QMainWindow):
         self._sensor_min_width = 1
         self._sensor_min_height = 1
         self._update_progress_dialog: UpdateProgressDialog | None = None
+        self.xy_stage: XYStageExecutor | None = None
+        self._xy_controller_limits: tuple[float, float, float, float] | None = None
+        self.spatial_worker: SpatialScanWorker | None = None
+        self.spatial_calibration = default_calibration(0.48)
+        self._survey_plan: TilePlan | None = None
+        self._acquisition_plan: TilePlan | None = None
+        self._spatial_roi: SpatialRect | None = None
+        self._spatial_composer: MosaicComposer | None = None
+        self._spatial_map_shape = (0, 0)
+        self._spatial_tile_states: dict[str, SpatialTile] = {}
+        self._spatial_tile_origins: dict[int, tuple[float, float]] = {}
+        self._last_spatial_tile: tuple[object, np.ndarray] | None = None
 
         self.bridge.progress.connect(self._on_scan_progress)
         self.bridge.done.connect(self._on_scan_done)
@@ -529,12 +588,18 @@ class MainWindow(QMainWindow):
         self.bridge.update_checked.connect(self._on_update_checked)
         self.bridge.update_download_progress.connect(self._on_update_download_progress)
         self.bridge.update_downloaded.connect(self._on_update_downloaded)
+        self.bridge.spatial_progress.connect(self._on_spatial_progress)
+        self.bridge.spatial_tile.connect(self._on_spatial_tile)
+        self.bridge.spatial_done.connect(self._on_spatial_done)
+        self.bridge.spatial_calibrated.connect(self._on_spatial_calibrated)
 
         self._build_ui()
         self._apply_style()
         self._refresh_ports()
+        self._refresh_xy_ports()
         self._sync_exposure_controls()
         self.status_timer.start()
+        self.xy_status_timer.start()
         enable_dark_title_bar(self, self._theme == "dark")
 
     def _load_theme(self) -> str:
@@ -645,6 +710,18 @@ class MainWindow(QMainWindow):
         self.image_settings_dialog = self._settings_dialog("图像设置", self._image_section())
         self.roi_settings_panel = self._roi_section()
         self.roi_settings_panel.hide()
+        self.xy_settings_dialog = XYStageControlDialog(parent=self)
+        self.xy_settings_dialog.tabs.addTab(self._xy_stage_box(), "空间扫描")
+        self.xy_settings_dialog.connect_requested.connect(self._connect_xy_stage_from_dialog)
+        self.xy_settings_dialog.disconnect_requested.connect(self._disconnect_xy_stage_from_dialog)
+        self.xy_settings_dialog.snapshot_updated.connect(self._on_xy_dialog_snapshot)
+        self.xy_settings_dialog.error_occurred.connect(
+            lambda message: self._log(f"XY 位移台: {message}")
+        )
+        # 侧栏“XY位移”只配置空间概览采集参数，与导航栏位移台控制弹窗分离。
+        self.xy_overview_dialog = self._settings_dialog(
+            "XY位移", self._spatial_overview_settings_box()
+        )
         self.pzt_settings_dialog = self._settings_dialog("PZT 位移", self._pzt_box())
         self.log_dialog = self._settings_dialog("运行日志", self._log_panel())
         self.log_dialog.setMinimumSize(720, 420)
@@ -652,6 +729,7 @@ class MainWindow(QMainWindow):
 
         self.camera_status = DeviceStatusLabel("相机: 未连接")
         self.pzt_status = DeviceStatusLabel("PZT: 未连接")
+        self.xy_status = DeviceStatusLabel("XY: 未连接")
 
         left_area = QWidget()
         left_area.setObjectName("leftArea")
@@ -688,11 +766,16 @@ class MainWindow(QMainWindow):
                 "pzt",
             )
         )
+        self.btn_xy_stage_control = self._settings_button(
+            "XY位移台控制", self.xy_settings_dialog, "xy"
+        )
+        top_bar_layout.addWidget(self.btn_xy_stage_control)
         top_bar_layout.addWidget(self._settings_button("运行日志", self.log_dialog, "log"))
         top_bar_layout.addWidget(self._settings_button("设置", self.app_settings_dialog, "settings"))
         top_bar_layout.addSpacing(10)
         top_bar_layout.addWidget(self.camera_status)
         top_bar_layout.addWidget(self.pzt_status)
+        top_bar_layout.addWidget(self.xy_status)
         top_bar_layout.addStretch()
         left_layout.addWidget(top_bar)
 
@@ -708,7 +791,17 @@ class MainWindow(QMainWindow):
         viewer_layout.setContentsMargins(12, 12, 12, 10)
         viewer_layout.setSpacing(8)
 
-        viewer_layout.addWidget(self.preview, 1)
+        self.viewer_tabs = QTabWidget()
+        self.viewer_tabs.setObjectName("viewerTabs")
+        camera_page = QWidget()
+        camera_layout = QVBoxLayout(camera_page)
+        camera_layout.setContentsMargins(0, 0, 0, 0)
+        camera_layout.addWidget(self.preview)
+        self.spatial_map = SpatialMapWidget()
+        self.spatial_map.roi_sample_selected.connect(self._spatial_roi_selected)
+        self.viewer_tabs.addTab(camera_page, "相机预览")
+        self.viewer_tabs.addTab(self.spatial_map, "样品地图")
+        viewer_layout.addWidget(self.viewer_tabs, 1)
 
         self.progress = QProgressBar()
         self.progress.setObjectName("scanProgress")
@@ -737,6 +830,7 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 8, 12, 14)
         side_layout.setSpacing(4)
         side_layout.addWidget(self._scan_tabs())
+        side_layout.addWidget(self._spatial_scan_box())
         side_layout.addWidget(self._calibration_box())
         side_layout.addWidget(self._save_box())
         side_layout.addWidget(self.roi_settings_panel)
@@ -749,7 +843,8 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(side_widget)
-        scroll.setFixedWidth(370)
+        # 四列参数区包含“中心起点/终点”等较长标签，留足宽度避免右列被裁切。
+        scroll.setFixedWidth(430)
 
         root_layout.addWidget(left_area, 1)
         root_layout.addWidget(scroll)
@@ -902,9 +997,15 @@ class MainWindow(QMainWindow):
         self.anti_flick.toggled.connect(self._anti_flick_changed)
         self.light_frequency.currentTextChanged.connect(self._light_frequency_changed)
         self.btn_once_wb.clicked.connect(lambda: self._safe_camera_call(self.camera.set_once_white_balance))
-        self.h_mirror.toggled.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_mirror(0, v)))
-        self.v_mirror.toggled.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_mirror(1, v)))
-        self.rotate.currentIndexChanged.connect(lambda idx: self._safe_camera_call(lambda: self.camera.set_rotate(idx)))
+        self.h_mirror.toggled.connect(
+            lambda v: self._camera_geometry_changed(lambda: self.camera.set_mirror(0, v))
+        )
+        self.v_mirror.toggled.connect(
+            lambda v: self._camera_geometry_changed(lambda: self.camera.set_mirror(1, v))
+        )
+        self.rotate.currentIndexChanged.connect(
+            lambda idx: self._camera_geometry_changed(lambda: self.camera.set_rotate(idx))
+        )
         self.contrast_slider.valueChanged.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_contrast(v)))
         self.gamma_slider.valueChanged.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_gamma(v)))
         self.saturation_slider.valueChanged.connect(lambda v: self._safe_camera_call(lambda: self.camera.set_saturation(v)))
@@ -964,6 +1065,153 @@ class MainWindow(QMainWindow):
         self.btn_restore_roi.clicked.connect(self._restore_roi_full_frame)
         self.btn_reset_roi.clicked.connect(self._reset_roi)
         return content
+
+    def _xy_stage_box(self) -> QFrame:
+        """主项目专属的空间标定设置页。
+
+        位移台连接、状态读数和手动/高级运动由 ``XYStageControlDialog``
+        统一提供，这里只保留采集程序额外需要的安全范围与空间标定入口。
+        """
+        content = QFrame()
+        content.setObjectName("xyStageTabContent")
+        layout = QGridLayout(content)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setHorizontalSpacing(8)
+        layout.setVerticalSpacing(8)
+
+        self.btn_xy_calibrate = QPushButton("自动空间标定")
+        self.xy_safe_x_min = self._dspin(-1000, 1000, 0, 4, 0.1)
+        self.xy_safe_x_max = self._dspin(-1000, 1000, 20, 4, 0.1)
+        self.xy_safe_y_min = self._dspin(-1000, 1000, 0, 4, 0.1)
+        self.xy_safe_y_max = self._dspin(-1000, 1000, 20, 4, 0.1)
+        for widget in (
+            self.xy_safe_x_min, self.xy_safe_x_max, self.xy_safe_y_min, self.xy_safe_y_max,
+        ):
+            widget.setReadOnly(True)
+            widget.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.btn_xy_calibrate.setObjectName("primaryButton")
+
+        hint = QLabel(
+            "空间扫描和自动标定与上方位移台控制共用同一个 SDK 工作线程。"
+            "扫描运行时手动运动会锁定，但单轴停止和全轴停止始终可用。"
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint, 0, 0, 1, 4)
+        layout.addWidget(self._label("X 安全范围"), 1, 0)
+        layout.addWidget(self.xy_safe_x_min, 1, 1)
+        layout.addWidget(self.xy_safe_x_max, 1, 2)
+        layout.addWidget(self._label("mm"), 1, 3)
+        layout.addWidget(self._label("Y 安全范围"), 2, 0)
+        layout.addWidget(self.xy_safe_y_min, 2, 1)
+        layout.addWidget(self.xy_safe_y_max, 2, 2)
+        layout.addWidget(self._label("mm"), 2, 3)
+        layout.addWidget(self.btn_xy_calibrate, 3, 0, 1, 4)
+        # 空余高度集中在底部，避免安全范围输入框被纵向拉开。
+        layout.setRowStretch(4, 1)
+
+        self.btn_xy_calibrate.clicked.connect(self._start_spatial_calibration)
+        return content
+
+    def _spatial_overview_settings_box(self) -> QFrame:
+        """侧栏 XY 标题对应的小弹窗，仅放置空间概览采集参数。"""
+        content = QFrame()
+        content.setObjectName("collapsibleContent")
+        layout = QGridLayout(content)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
+
+        self.spatial_pixel_um = self._dspin(0.01, 10.0, 0.48, 6, 0.01)
+        self.spatial_overlap = self._ispin(10, 40, 20)
+        self.spatial_overlap.setSuffix(" %")
+        self.spatial_settle = self._ispin(0, 5000, 200)
+        self.spatial_settle.setSuffix(" ms")
+        self.spatial_route = self._combo(["蛇形", "单向"], "蛇形")
+
+        layout.addWidget(self._label("像素间距 (µm/px)"), 0, 0)
+        layout.addWidget(self.spatial_pixel_um, 0, 1)
+        layout.addWidget(self._label("重叠率"), 1, 0)
+        layout.addWidget(self.spatial_overlap, 1, 1)
+        layout.addWidget(self._label("稳定时间"), 2, 0)
+        layout.addWidget(self.spatial_settle, 2, 1)
+        layout.addWidget(self._label("概览路径"), 3, 0)
+        layout.addWidget(self.spatial_route, 3, 1)
+        layout.setColumnStretch(1, 1)
+        return content
+
+    def _spatial_scan_box(self) -> QGroupBox:
+        box = QGroupBox()
+        box.setObjectName("xySpatialGroup")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setHorizontalSpacing(6)
+        layout.setVerticalSpacing(7)
+        layout.setColumnStretch(1, 1)
+        layout.setColumnStretch(3, 1)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(7)
+        self.btn_xy_section_title = QToolButton()
+        self.btn_xy_section_title.setObjectName("xySectionTitle")
+        self.btn_xy_section_title.setText("XY位移")
+        self.btn_xy_section_title.setToolTip("设置空间概览参数")
+        self.btn_xy_section_title.setAccessibleName("打开 XY 空间概览参数")
+        self.btn_xy_section_title.setCursor(Qt.PointingHandCursor)
+        self.btn_xy_section_title.clicked.connect(
+            lambda: self._show_settings_dialog(self.xy_overview_dialog)
+        )
+        self.xy_realtime_position = QLabel("X=-- mm  Y=-- mm")
+        self.xy_realtime_position.setObjectName("xyRealtimePosition")
+        self.xy_axis_lamps = {0: StatusLamp("X"), 1: StatusLamp("Y")}
+        header.addWidget(self.btn_xy_section_title)
+        header.addWidget(self.xy_realtime_position)
+        header.addStretch(1)
+        header.addWidget(self.xy_axis_lamps[0])
+        header.addWidget(self.xy_axis_lamps[1])
+        layout.addLayout(header, 0, 0, 1, 4)
+
+        self.survey_x_start = self._dspin(-1000, 1000, 1.0, 4, 0.1)
+        self.survey_x_end = self._dspin(-1000, 1000, 2.0, 4, 0.1)
+        self.survey_y_start = self._dspin(-1000, 1000, 1.0, 4, 0.1)
+        self.survey_y_end = self._dspin(-1000, 1000, 2.0, 4, 0.1)
+        self.spatial_roi_status = QLabel("空间 ROI: 未选择")
+        self.spatial_roi_status.setWordWrap(True)
+        self.btn_start_survey = QPushButton("概览扫描")
+        self.btn_select_spatial_roi = QPushButton("框选区域")
+        self.btn_plan_spatial = QPushButton("规划")
+        self.btn_start_spatial = QPushButton("执行纵向扫描")
+        self.btn_stop_spatial = QPushButton("停止")
+        self.btn_start_survey.setObjectName("primaryButton")
+        self.btn_start_spatial.setObjectName("primaryButton")
+        self.btn_stop_spatial.setObjectName("dangerButton")
+        for button in (self.btn_select_spatial_roi, self.btn_plan_spatial):
+            button.setObjectName("secondaryButton")
+        self.btn_stop_spatial.setEnabled(False)
+
+        fields = (
+            ("X 中心起点", self.survey_x_start, "X 中心终点", self.survey_x_end),
+            ("Y 中心起点", self.survey_y_start, "Y 中心终点", self.survey_y_end),
+        )
+        for row, (left_text, left, right_text, right) in enumerate(fields, start=1):
+            layout.addWidget(self._label(left_text), row, 0)
+            layout.addWidget(left, row, 1)
+            layout.addWidget(self._label(right_text), row, 2)
+            layout.addWidget(right, row, 3)
+        layout.addWidget(self.spatial_roi_status, 3, 0, 1, 4)
+        layout.addWidget(self.btn_start_survey, 4, 0, 1, 2)
+        layout.addWidget(self.btn_select_spatial_roi, 4, 2, 1, 2)
+        layout.addWidget(self.btn_plan_spatial, 5, 0)
+        layout.addWidget(self.btn_start_spatial, 5, 1, 1, 2)
+        layout.addWidget(self.btn_stop_spatial, 5, 3)
+
+        self.btn_start_survey.clicked.connect(self._start_spatial_survey)
+        self.btn_select_spatial_roi.clicked.connect(self._activate_spatial_selection)
+        self.btn_plan_spatial.clicked.connect(self._plan_selected_spatial_roi)
+        self.btn_start_spatial.clicked.connect(self._start_spatial_acquisition)
+        self.btn_stop_spatial.clicked.connect(self._stop_spatial_scan)
+        self.spatial_pixel_um.editingFinished.connect(self._spatial_pixel_size_changed)
+        return box
 
     def _pzt_box(self) -> QFrame:
         content = QFrame()
@@ -1409,6 +1657,41 @@ class MainWindow(QMainWindow):
                 color: {p["title"]};
                 background: {p["panel"]};
             }}
+            QGroupBox#xySpatialGroup {{
+                margin-top: 6px;
+                padding-top: 6px;
+            }}
+            QToolButton#xySectionTitle {{
+                color: {p["title"]};
+                background: transparent;
+                border: 0;
+                border-radius: 2px;
+                padding: 3px 5px;
+                font-size: 13px;
+                font-weight: 700;
+            }}
+            QToolButton#xySectionTitle:hover {{
+                color: {p["accent"]};
+                background: {p["accent_soft"]};
+            }}
+            QToolButton#xySectionTitle:pressed {{
+                background: {p["button_pressed"]};
+            }}
+            QLabel#xyRealtimePosition {{
+                color: {p["text"]};
+                background: transparent;
+                border: 0;
+                padding: 3px 1px;
+                font-family: "Consolas", "Microsoft YaHei UI", sans-serif;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QLabel#technicalReadout {{
+                color: {p["text_soft"]};
+                background: transparent;
+                border: 0;
+                font-size: 11px;
+            }}
             QFrame#collapsible {{
                 background: {p["panel_alt"]};
                 border: 1px solid {p["border"]};
@@ -1417,6 +1700,17 @@ class MainWindow(QMainWindow):
             QFrame#collapsibleContent {{
                 background: {p["panel_alt"]};
                 border-top: 1px solid {p["border"]};
+            }}
+            QDialog#xyStageDialog,
+            QWidget#xyStageManualPage,
+            QWidget#xyStageGridPage,
+            QWidget#xyStageAdvancedPanel,
+            QFrame#xyStageTabContent,
+            QTabWidget#xyStageTabs,
+            QTabWidget#xyStageTabs::pane,
+            QTabWidget#xyStageAdvancedTabs,
+            QTabWidget#xyStageAdvancedTabs::pane {{
+                background: {p["panel"]};
             }}
             QToolButton#disclosure {{
                 border: 0;
@@ -1677,6 +1971,8 @@ class MainWindow(QMainWindow):
             self.camera_status.set_theme_colors(palette["text"], palette["device_ok"], palette["device_bad"])
         if hasattr(self, "pzt_status"):
             self.pzt_status.set_theme_colors(palette["text"], palette["device_ok"], palette["device_bad"])
+        if hasattr(self, "xy_status"):
+            self.xy_status.set_theme_colors(palette["text"], palette["device_ok"], palette["device_bad"])
         if hasattr(self, "theme_combo"):
             self.theme_combo.blockSignals(True)
             self.theme_combo.setCurrentText(THEME_LABELS[self._theme])
@@ -1782,6 +2078,7 @@ class MainWindow(QMainWindow):
             self._refresh_camera_capabilities()
             self._apply_current_bit_depth()
             self.camera_status.setText(f"相机: 已连接 {self.camera.width}x{self.camera.height}")
+            self._update_spatial_center_ranges()
             self._log("相机初始化完成")
         except Exception as exc:
             self._show_error("相机连接失败", exc)
@@ -1792,6 +2089,7 @@ class MainWindow(QMainWindow):
             if not self.camera.initialized:
                 return
         self.camera.reset_capture_count()
+        self.camera.reset_timeout_counters()
         self.camera.set_trigger_mode(0)
         self.preview_timer.start()
         self.btn_preview.setEnabled(False)
@@ -1818,6 +2116,19 @@ class MainWindow(QMainWindow):
         self._update_camera_health()
         self._refresh_exposure_readback()
 
+    def _update_xy_status_readback(self) -> None:
+        """无论位移台弹窗是否打开，都从 executor 的线程安全快照刷新主界面。"""
+        if self.xy_stage is None:
+            self.xy_status.setText("XY: 未连接")
+            self.xy_realtime_position.setText("X=-- mm  Y=-- mm")
+            for lamp in self.xy_axis_lamps.values():
+                lamp.set_state("off", "位移台未连接")
+            return
+        try:
+            self._on_xy_dialog_snapshot(self.xy_stage.snapshot)
+        except Exception as exc:
+            self._log(f"XY 状态刷新失败: {exc}")
+
     def _update_camera_health(self) -> None:
         if not self.camera.initialized:
             self.fps_status.setText("显示: -- FPS | 采集帧: 0")
@@ -1828,7 +2139,8 @@ class MainWindow(QMainWindow):
         age_text = "--" if health.latest_frame_age_ms is None else f"{health.latest_frame_age_ms:.0f} ms"
         lost_text = "--" if health.sdk_lost_frames is None else str(health.sdk_lost_frames)
         self.fps_status.setText(
-            f"显示: {display_fps:.1f} FPS | 帧: {health.capture_count} | 丢帧: {lost_text} | 超时: {health.timeout_count} | 帧龄: {age_text}"
+            f"显示: {display_fps:.1f} FPS | 帧: {health.capture_count} | 丢帧: {lost_text} | "
+            f"异常超时: {health.timeout_count} | 触发等待: {health.trigger_wait_count} | 帧龄: {age_text}"
         )
         reconnect = "--" if health.reconnect_count is None else str(health.reconnect_count)
         self.fps_status.setToolTip((health.last_error or "相机最近无错误") + f"\n自动重连次数: {reconnect}")
@@ -2152,13 +2464,22 @@ class MainWindow(QMainWindow):
         self.calibration_status.setText(f"校正: {dark} | {flat}")
 
     def _invalidate_calibration(self, reason: str) -> None:
-        if self._dark_average is None and self._flat_average is None:
-            return
-        self._dark_average = None
-        self._flat_average = None
-        self._calibration_signature = None
-        self._update_calibration_status()
-        self._log(f"校准已失效: {reason}")
+        had_camera_calibration = self._dark_average is not None or self._flat_average is not None
+        if had_camera_calibration:
+            self._dark_average = None
+            self._flat_average = None
+            self._calibration_signature = None
+            self._update_calibration_status()
+        had_spatial_calibration = bool(getattr(self, "spatial_calibration", None) and self.spatial_calibration.fingerprint)
+        had_spatial_state = self._survey_plan is not None or self._acquisition_plan is not None
+        if hasattr(self, "spatial_pixel_um"):
+            self.spatial_calibration = default_calibration(self.spatial_pixel_um.value())
+            self._survey_plan = None
+            self._acquisition_plan = None
+            self._spatial_roi = None
+            self.spatial_roi_status.setText("空间 ROI: 标定已失效")
+        if had_camera_calibration or had_spatial_calibration or had_spatial_state:
+            self._log(f"校准已失效: {reason}")
 
     def _connection_type_changed(self, text: str) -> None:
         self.baud_combo.setEnabled(text == "串口")
@@ -2172,6 +2493,637 @@ class MainWindow(QMainWindow):
         else:
             self.port_combo.addItem(PZT_DEFAULT_IP)
             self.baud_combo.setCurrentText(str(PZT_UDP_PORT))
+
+    def _refresh_xy_ports(self) -> None:
+        if hasattr(self, "xy_settings_dialog"):
+            self.xy_settings_dialog.refresh_ports()
+
+    def _xy_dll_dir(self) -> Path:
+        candidates: list[Path] = []
+        configured = os.environ.get("HTGE_XY_STAGE_DLL_DIR")
+        if configured:
+            candidates.append(Path(configured))
+        candidates.extend(
+            [
+                Path(__file__).resolve().parents[1] / "xy_stage" / "vendor" / "x64",
+                Path(sys.executable).resolve().parent / "vendor" / "x64",
+            ]
+        )
+        for candidate in candidates:
+            if (candidate / "zauxdll.dll").exists() and (candidate / "zmotion.dll").exists():
+                return candidate
+        raise RuntimeError(
+            "未找到 XY 位移台 DLL。请将 zauxdll.dll 和 zmotion.dll 放入 "
+            "grab_app/xy_stage/vendor/x64，或设置 HTGE_XY_STAGE_DLL_DIR。"
+        )
+
+    def _connect_xy_stage_from_dialog(self, port: str) -> None:
+        try:
+            if self.xy_stage is not None and self.xy_stage.connected:
+                self.xy_settings_dialog.set_executor(self.xy_stage)
+                return
+            port = port.strip().upper()
+            if not port:
+                raise RuntimeError("请选择 XY 位移台串口")
+            executor = XYStageExecutor(self._xy_dll_dir())
+            try:
+                snapshot = executor.connect(port)
+            except Exception:
+                executor.close()
+                raise
+            self.xy_stage = executor
+            if not snapshot.parameter_valid:
+                message = snapshot.fault_message or "XY 位移台参数校验未通过"
+                executor.close()
+                self.xy_stage = None
+                raise RuntimeError(message)
+            self.xy_settings_dialog.set_executor(executor)
+            self.xy_status.setText("XY: 已连接")
+            self._update_xy_snapshot(snapshot)
+            self._log(f"XY 位移台已连接: {port}")
+        except Exception as exc:
+            if self.xy_stage is not None:
+                try:
+                    self.xy_stage.close()
+                finally:
+                    self.xy_stage = None
+            self.xy_settings_dialog.set_executor(None)
+            self._show_error("XY 位移台连接失败", exc)
+
+    def _disconnect_xy_stage_from_dialog(self) -> None:
+        try:
+            if self.xy_settings_dialog.task_locked:
+                raise RuntimeError("自动扫描或轨迹运行中，不能断开 XY 位移台")
+            if self.xy_stage is not None:
+                self.xy_stage.close()
+                self.xy_stage = None
+            self.xy_settings_dialog.set_executor(None)
+            self.xy_status.setText("XY: 未连接")
+            self._log("XY 位移台已断开")
+        except Exception as exc:
+            self._show_error("XY 位移台断开失败", exc)
+
+    def _toggle_xy_stage(self) -> None:
+        """兼容旧调用入口，实际连接控件由完整控制弹窗持有。"""
+        if self.xy_stage is not None and self.xy_stage.connected:
+            self._disconnect_xy_stage_from_dialog()
+        else:
+            self._connect_xy_stage_from_dialog(self.xy_settings_dialog.port_combo.currentText())
+
+    def _enable_xy_stage(self) -> None:
+        try:
+            if self.xy_stage is None or not self.xy_stage.connected:
+                raise RuntimeError("请先连接 XY 位移台")
+            snapshot = self.xy_stage.set_enabled(True)
+            self._update_xy_snapshot(snapshot)
+            self._log("XY 双轴已使能")
+        except Exception as exc:
+            self._show_error("XY 位移台使能失败", exc)
+
+    def _clear_xy_stage(self) -> None:
+        try:
+            if self.xy_stage is None or not self.xy_stage.connected:
+                raise RuntimeError("请先连接 XY 位移台")
+            snapshot = self.xy_stage.clear_errors()
+            self._update_xy_snapshot(snapshot)
+            self._log("XY 位移台报警已清除")
+        except Exception as exc:
+            self._show_error("XY 位移台清错失败", exc)
+
+    def _update_xy_snapshot(self, snapshot: object) -> None:
+        axes = getattr(snapshot, "axes", {})
+        if 0 not in axes or 1 not in axes:
+            return
+        self.xy_settings_dialog.update_snapshot(snapshot)
+        self._on_xy_dialog_snapshot(snapshot)
+
+    def _on_xy_dialog_snapshot(self, snapshot: object) -> None:
+        axes = getattr(snapshot, "axes", {})
+        connected = bool(getattr(snapshot, "connected", False))
+        if connected and 0 in axes and 1 in axes:
+            self.xy_status.setText("XY: 已连接")
+            x_text = f"{axes[0].dpos:.4f}".rstrip("0").rstrip(".")
+            y_text = f"{axes[1].dpos:.4f}".rstrip("0").rstrip(".")
+            self.xy_realtime_position.setText(f"X={x_text} mm  Y={y_text} mm")
+            for axis, name in ((0, "X"), (1, "Y")):
+                status = axes[axis]
+                if bool(getattr(status, "hard_fault", False)) or bool(
+                    getattr(status, "positive_any_limit", False)
+                    or getattr(status, "negative_any_limit", False)
+                ):
+                    state, detail = "alarm", f"{name} 轴报警或限位"
+                elif bool(getattr(status, "running", False)) or bool(
+                    getattr(status, "homing", False)
+                ):
+                    state, detail = "active", f"{name} 轴运动中"
+                elif bool(getattr(status, "enabled", False)):
+                    state, detail = "ok", f"{name} 轴已连接并使能"
+                else:
+                    state, detail = "warning", f"{name} 轴已连接但未使能"
+                self.xy_axis_lamps[axis].set_state(state, detail)
+            controller_limits = (
+                float(axes[0].soft_min_position), float(axes[0].soft_max_position),
+                float(axes[1].soft_min_position), float(axes[1].soft_max_position),
+            )
+            if controller_limits != self._xy_controller_limits:
+                self._xy_controller_limits = controller_limits
+                for widget in (
+                    self.xy_safe_x_min, self.xy_safe_x_max,
+                    self.xy_safe_y_min, self.xy_safe_y_max,
+                ):
+                    widget.setSpecialValueText("")
+                for widget in (self.xy_safe_x_min, self.xy_safe_x_max):
+                    widget.setRange(controller_limits[0], controller_limits[1])
+                for widget in (self.xy_safe_y_min, self.xy_safe_y_max):
+                    widget.setRange(controller_limits[2], controller_limits[3])
+                self.xy_safe_x_min.setValue(controller_limits[0])
+                self.xy_safe_x_max.setValue(controller_limits[1])
+                self.xy_safe_y_min.setValue(controller_limits[2])
+                self.xy_safe_y_max.setValue(controller_limits[3])
+                self._update_spatial_center_ranges()
+        else:
+            self.xy_status.setText("XY: 未连接")
+            self.xy_realtime_position.setText("X=-- mm  Y=-- mm")
+            for lamp in self.xy_axis_lamps.values():
+                lamp.set_state("off", "位移台未连接")
+            self._xy_controller_limits = None
+            self._update_spatial_center_ranges()
+
+    def _spatial_safety_changed(self) -> None:
+        try:
+            self._spatial_safety_limits()
+            self._update_spatial_center_ranges()
+        except ValueError:
+            # 让用户完成另一端输入后再统一提示，不在编辑半途中弹窗。
+            return
+
+    def _update_spatial_center_ranges(self) -> None:
+        """按控制器当前 RS_LIMIT/FS_LIMIT 更新概览 DPOS 输入范围。"""
+        try:
+            limits = self._spatial_safety_limits()
+        except ValueError:
+            return
+        x_min, x_max = limits.x_min_mm, limits.x_max_mm
+        y_min, y_max = limits.y_min_mm, limits.y_max_mm
+        if x_min < x_max:
+            for widget in (self.survey_x_start, self.survey_x_end):
+                widget.setRange(x_min, x_max)
+        if y_min < y_max:
+            for widget in (self.survey_y_start, self.survey_y_end):
+                widget.setRange(y_min, y_max)
+
+    def _start_spatial_calibration(self) -> None:
+        if self.xy_stage is None or not self.xy_stage.connected:
+            self._show_error("空间标定失败", RuntimeError("请先连接并使能 XY 位移台"))
+            return
+        if not self.camera.initialized:
+            self._show_error("空间标定失败", RuntimeError("请先连接相机"))
+            return
+        if self.spatial_worker is not None and self.spatial_worker.running:
+            self._show_error("空间标定失败", RuntimeError("空间扫描正在运行"))
+            return
+        self.preview_timer.stop()
+        self.btn_xy_calibrate.setEnabled(False)
+        limits = self._spatial_safety_limits()
+        settle_seconds = self.spatial_settle.value() / 1000.0
+        fingerprint = self._spatial_calibration_fingerprint()
+        threading.Thread(
+            target=self._run_spatial_calibration,
+            args=(limits, settle_seconds, fingerprint),
+            name="spatial-calibration",
+            daemon=True,
+        ).start()
+
+    def _run_spatial_calibration(
+        self,
+        limits: SafetyLimits,
+        settle_seconds: float,
+        fingerprint: dict[str, object],
+    ) -> None:
+        try:
+            assert self.xy_stage is not None
+            snapshot = self.xy_stage.refresh_status()
+            x0, y0 = snapshot.axes[0].dpos, snapshot.axes[1].dpos
+            step = 0.2
+            dx = step if x0 + step <= limits.x_max_mm else -step
+            dy = step if y0 + step <= limits.y_max_mm else -step
+            if not limits.x_min_mm <= x0 + dx <= limits.x_max_mm:
+                raise RuntimeError("当前位置附近没有足够的 X 标定空间")
+            if not limits.y_min_mm <= y0 + dy <= limits.y_max_mm:
+                raise RuntimeError("当前位置附近没有足够的 Y 标定空间")
+            self.camera.apply_quantitative_profile()
+            self.camera.set_trigger_mode(1)
+            base = self.camera.soft_trigger_and_grab_sample(2000)
+            if base is None:
+                raise RuntimeError("获取标定基准图失败")
+            self.xy_stage.move_absolute_blocking(x0 + dx, y0, timeout_seconds=30)
+            time.sleep(settle_seconds)
+            x_sample = self.camera.soft_trigger_and_grab_sample(2000)
+            self.xy_stage.move_absolute_blocking(x0, y0, timeout_seconds=30)
+            self.xy_stage.move_absolute_blocking(x0, y0 + dy, timeout_seconds=30)
+            time.sleep(settle_seconds)
+            y_sample = self.camera.soft_trigger_and_grab_sample(2000)
+            self.xy_stage.move_absolute_blocking(x0, y0, timeout_seconds=30)
+            if x_sample is None or y_sample is None:
+                raise RuntimeError("标定图像不足")
+            base_f = base.frame.astype(np.float32)
+            x_f = x_sample.frame.astype(np.float32)
+            y_f = y_sample.frame.astype(np.float32)
+            (x_dx, x_dy), x_response = cv2.phaseCorrelate(base_f, x_f)
+            (y_dx, y_dy), y_response = cv2.phaseCorrelate(base_f, y_f)
+            if min(x_response, y_response) < 0.1:
+                raise RuntimeError(
+                    f"空间标定相关度过低: X={x_response:.3f}, Y={y_response:.3f}"
+                )
+            fit = fit_affine_calibration(
+                [(x0, y0), (x0 + dx, y0), (x0, y0 + dy)],
+                [(0.0, 0.0), (x_dx, x_dy), (y_dx, y_dy)],
+                fingerprint=fingerprint,
+            )
+            self.bridge.spatial_calibrated.emit(fit, None)
+        except Exception as exc:
+            try:
+                if self.xy_stage is not None and self.xy_stage.connected:
+                    self.xy_stage.stop_all()
+            except Exception:
+                pass
+            self.bridge.spatial_calibrated.emit(None, exc)
+        finally:
+            try:
+                if self.camera.initialized:
+                    self.camera.set_trigger_mode(0)
+            except Exception:
+                pass
+
+    def _on_spatial_calibrated(self, fit: object, exc: object) -> None:
+        self.btn_xy_calibrate.setEnabled(True)
+        if exc is not None:
+            self._show_error("空间标定失败", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            return
+        if fit is None:
+            return
+        self.spatial_calibration = fit.calibration
+        self.spatial_pixel_um.setValue(fit.calibration.pixel_size_um)
+        self._update_spatial_center_ranges()
+        self._log(f"空间标定完成: 等效 {fit.calibration.pixel_size_um:.6f} µm/px, RMS={fit.rms_px:.3f} px")
+
+    def _spatial_safety_limits(self) -> SafetyLimits:
+        values = (
+            self.xy_safe_x_min.value(), self.xy_safe_x_max.value(),
+            self.xy_safe_y_min.value(), self.xy_safe_y_max.value(),
+        )
+        if values[0] >= values[1] or values[2] >= values[3]:
+            raise ValueError("XY 应用安全范围无效")
+        return SafetyLimits(*values)
+
+    def _spatial_pixel_size_changed(self) -> None:
+        if abs(self.spatial_calibration.pixel_size_um - self.spatial_pixel_um.value()) <= 1e-9:
+            return
+        self.spatial_calibration = default_calibration(self.spatial_pixel_um.value())
+        self._survey_plan = None
+        self._acquisition_plan = None
+        self._spatial_roi = None
+        self.spatial_roi_status.setText("空间 ROI: 像素间距已变化，请重新概览")
+        self._update_spatial_center_ranges()
+        self._log(f"空间像素间距已设为 {self.spatial_pixel_um.value():.6f} µm/px")
+
+    def _spatial_calibration_fingerprint(self) -> dict[str, object]:
+        return {
+            "width": int(getattr(self.camera, "width", 0)),
+            "height": int(getattr(self.camera, "height", 0)),
+            "pixel_size_um_input": self.spatial_pixel_um.value(),
+            "roi": self._stable_camera_signature().get("roi_width"),
+        }
+
+    def _spatial_rect_from_controls(self) -> SpatialRect:
+        x0, x1 = self.survey_x_start.value(), self.survey_x_end.value()
+        y0, y1 = self.survey_y_start.value(), self.survey_y_end.value()
+        return SpatialRect(
+            min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1),
+        )
+
+    def _plan_spatial_center_scan(self) -> TilePlan:
+        if not self.camera.initialized:
+            raise RuntimeError("请先连接相机")
+        calibration = self.spatial_calibration
+        if abs(calibration.pixel_size_um - self.spatial_pixel_um.value()) > 1e-9:
+            calibration = default_calibration(
+                self.spatial_pixel_um.value(), fingerprint=self._spatial_calibration_fingerprint()
+            )
+        route = "serpentine" if self.spatial_route.currentText() == "蛇形" else "unidirectional"
+        return plan_center_scan(
+            self.survey_x_start.value(), self.survey_x_end.value(),
+            self.survey_y_start.value(), self.survey_y_end.value(),
+            (int(self.camera.width), int(self.camera.height)), calibration,
+            self.spatial_overlap.value() / 100.0,
+            route=route,
+            safety_limits=self._spatial_safety_limits(),
+        )
+
+    def _plan_spatial_rect(self, rect: SpatialRect) -> TilePlan:
+        if not self.camera.initialized:
+            raise RuntimeError("请先连接相机")
+        calibration = self.spatial_calibration
+        if abs(calibration.pixel_size_um - self.spatial_pixel_um.value()) > 1e-9:
+            calibration = default_calibration(
+                self.spatial_pixel_um.value(), fingerprint=self._spatial_calibration_fingerprint()
+            )
+        route = "serpentine" if self.spatial_route.currentText() == "蛇形" else "unidirectional"
+        return plan_tiles(
+            rect,
+            (int(self.camera.width), int(self.camera.height)),
+            calibration,
+            self.spatial_overlap.value() / 100.0,
+            route=route,
+            safety_limits=self._spatial_safety_limits(),
+        )
+
+    def _prepare_spatial_map(self, plan: TilePlan) -> None:
+        width_mm, height_mm = plan.roi.width_mm, plan.roi.height_mm
+        scale = min(1600.0 / max(width_mm, 1e-9), 1000.0 / max(height_mm, 1e-9))
+        width = max(320, min(1600, int(round(width_mm * scale))))
+        height = max(240, min(1000, int(round(height_mm * scale))))
+        self._spatial_map_shape = (height, width)
+        self.spatial_map.set_map_size(width, height)
+        self.spatial_map.set_map_physical_bounds(
+            plan.roi.x_min_mm, plan.roi.y_min_mm, plan.roi.x_max_mm, plan.roi.y_max_mm
+        )
+        self._spatial_composer = MosaicComposer((height, width), mode="feather")
+        route = [self._stage_point_to_map(plan, item.target.x_mm, item.target.y_mm) for item in plan.placements]
+        self.spatial_map.set_route(route)
+        tile_states: list[SpatialTile] = []
+        for item in plan.placements:
+            rect = self._stage_rect_to_map(plan, item.bounds)
+            tile_states.append(SpatialTile(f"{item.row}:{item.column}", rect, "pending"))
+        self.spatial_map.set_tile_states(tile_states)
+        self.spatial_map.clear_map_image()
+        self._spatial_tile_states = {tile.tile_id: tile for tile in tile_states}
+        self._spatial_tile_origins.clear()
+        self._last_spatial_tile = None
+        self.viewer_tabs.setCurrentIndex(1)
+
+    def _stage_point_to_map(self, plan: TilePlan, x_mm: float, y_mm: float) -> QPointF:
+        height, width = self._spatial_map_shape
+        return QPointF(
+            (x_mm - plan.roi.x_min_mm) / max(plan.roi.width_mm, 1e-9) * width,
+            (y_mm - plan.roi.y_min_mm) / max(plan.roi.height_mm, 1e-9) * height,
+        )
+
+    def _stage_rect_to_map(self, plan: TilePlan, rect: SpatialRect) -> QRect:
+        height, width = self._spatial_map_shape
+        x = round((rect.x_min_mm - plan.roi.x_min_mm) / max(plan.roi.width_mm, 1e-9) * width)
+        y = round((rect.y_min_mm - plan.roi.y_min_mm) / max(plan.roi.height_mm, 1e-9) * height)
+        w = max(1, round(rect.width_mm / max(plan.roi.width_mm, 1e-9) * width))
+        h = max(1, round(rect.height_mm / max(plan.roi.height_mm, 1e-9) * height))
+        return QRect(x, y, w, h)
+
+    def _map_image_from_composer(self) -> None:
+        if self._spatial_composer is None:
+            return
+        image = self._spatial_composer.image(np.dtype(np.uint8))
+        self.spatial_map.set_map_image(frame_to_pixmap(image, image.shape[1], image.shape[0]))
+
+    def _activate_spatial_selection(self) -> None:
+        if self._survey_plan is None:
+            self._show_error("框选空间 ROI", RuntimeError("请先完成一次概览扫描"))
+            return
+        self.viewer_tabs.setCurrentIndex(1)
+        self.spatial_map.set_selection_enabled(True)
+        self._log("请在样品地图上拖拽框选空间 ROI，按 Esc 或右键取消")
+
+    def _spatial_roi_selected(self, x: float, y: float, width: float, height: float) -> None:
+        try:
+            rect = SpatialRect(x, y, x + width, y + height)
+            self._spatial_roi = rect
+            self.spatial_roi_status.setText(
+                f"空间 ROI: X {rect.x_min_mm:.4f}–{rect.x_max_mm:.4f} mm, "
+                f"Y {rect.y_min_mm:.4f}–{rect.y_max_mm:.4f} mm"
+            )
+            self._log("空间 ROI 已选择")
+        except Exception as exc:
+            self._show_error("空间 ROI 无效", exc)
+
+    def _plan_selected_spatial_roi(self) -> None:
+        try:
+            if self._spatial_roi is None:
+                raise RuntimeError("请先在样品地图上框选空间 ROI")
+            self._acquisition_plan = self._plan_spatial_rect(self._spatial_roi)
+            basis = self._survey_plan or self._acquisition_plan
+            self.spatial_map.set_route(
+                [self._stage_point_to_map(basis, item.target.x_mm, item.target.y_mm)
+                 for item in self._acquisition_plan.placements]
+            )
+            states = [
+                SpatialTile(
+                    f"{item.row}:{item.column}",
+                    self._stage_rect_to_map(basis, item.bounds),
+                    "pending",
+                )
+                for item in self._acquisition_plan.placements
+            ]
+            self.spatial_map.set_tile_states(states)
+            self._spatial_tile_states = {tile.tile_id: tile for tile in states}
+            self._log(
+                f"空间路径已规划: {self._acquisition_plan.rows}×{self._acquisition_plan.columns}，"
+                f"共 {self._acquisition_plan.tile_count} 个 XY 瓦片"
+            )
+        except Exception as exc:
+            self._show_error("空间路径规划失败", exc)
+
+    def _new_spatial_worker(self) -> SpatialScanWorker:
+        if self.xy_stage is None or not self.xy_stage.connected:
+            raise RuntimeError("请先连接 XY 位移台")
+        if self.xy_settings_dialog.task_locked:
+            raise RuntimeError("XY 位移台已有二维扫描或轨迹任务在运行")
+        return SpatialScanWorker(
+            self.camera,
+            self.scanner,
+            self.xy_stage,
+            lambda text, current, total, placement: self.bridge.spatial_progress.emit(
+                text, current, total, placement
+            ),
+            lambda placement, sample, actual: self.bridge.spatial_tile.emit(
+                placement, sample, actual
+            ),
+            self._log,
+        )
+
+    def _start_spatial_survey(self) -> None:
+        try:
+            if not self.camera.initialized:
+                raise RuntimeError("请先连接相机")
+            if self.xy_stage is None or not self.xy_stage.connected:
+                raise RuntimeError("请先连接 XY 位移台")
+            if abs(self.spatial_calibration.pixel_size_um - self.spatial_pixel_um.value()) > 1e-9:
+                self.spatial_calibration = default_calibration(
+                    self.spatial_pixel_um.value(), fingerprint=self._spatial_calibration_fingerprint()
+                )
+            plan = self._plan_spatial_center_scan()
+            self._survey_plan = plan
+            self._acquisition_plan = None
+            self._spatial_roi = None
+            self.spatial_roi_status.setText("空间 ROI: 未选择")
+            self._prepare_spatial_map(plan)
+            save_dir = Path(self.save_path.text())
+            save_dir.mkdir(parents=True, exist_ok=True)
+            if self.preview_timer.isActive():
+                self._stop_preview()
+            self.spatial_worker = self._new_spatial_worker()
+            self._set_spatial_locked(True)
+            self.spatial_worker.start_survey(
+                SurveyConfig(
+                    plan=plan,
+                    save_dir=save_dir,
+                    prefix=self.prefix.text() or "survey",
+                    extension=self.image_format.currentText(),
+                    bit_depth=8 if self.bit_depth.currentIndex() == 0 else 12,
+                    settle_ms=self.spatial_settle.value(),
+                    calibration=self.spatial_calibration,
+                ),
+                lambda result, exc: self.bridge.spatial_done.emit(result, exc),
+            )
+            self._log(f"XY 概览扫描开始: {plan.rows}×{plan.columns}，共 {plan.tile_count} 瓦片")
+        except Exception as exc:
+            self._set_spatial_locked(False)
+            self._show_error("概览扫描启动失败", exc)
+
+    def _start_spatial_acquisition(self) -> None:
+        try:
+            if self._acquisition_plan is None:
+                self._plan_selected_spatial_roi()
+            if self._acquisition_plan is None:
+                return
+            if not self.pzt.connected:
+                raise RuntimeError("请先连接 PZT")
+            save_dir = Path(self.save_path.text())
+            save_dir.mkdir(parents=True, exist_ok=True)
+            pzt_config = self._scan_config(save_dir)
+            if self.preview_timer.isActive():
+                self._stop_preview()
+            self._pause_pzt_monitor_for_scan()
+            self.spatial_worker = self._new_spatial_worker()
+            self._set_spatial_locked(True)
+            self.spatial_worker.start_acquisition(
+                SpatialAcquisitionConfig(
+                    plan=self._acquisition_plan,
+                    pzt_config=pzt_config,
+                    save_dir=save_dir,
+                    settle_ms=self.spatial_settle.value(),
+                ),
+                lambda result, exc: self.bridge.spatial_done.emit(result, exc),
+            )
+            self._log(
+                f"空间纵向扫描开始: {self._acquisition_plan.tile_count} 个 XY 瓦片，"
+                "每个瓦片执行一次完整 PZT 扫描"
+            )
+        except Exception as exc:
+            self._restore_pzt_monitor_after_scan()
+            self._set_spatial_locked(False)
+            self._show_error("空间扫描启动失败", exc)
+
+    def _stop_spatial_scan(self) -> None:
+        if self.spatial_worker is not None:
+            self.spatial_worker.stop()
+            self.spatial_worker.wait(timeout=5.0)
+        self._log("正在停止 XY 与 PZT 空间扫描...")
+
+    def _set_spatial_locked(self, locked: bool) -> None:
+        self._set_scan_locked(locked)
+        self.btn_start_survey.setEnabled(not locked)
+        self.btn_select_spatial_roi.setEnabled(not locked)
+        self.btn_plan_spatial.setEnabled(not locked)
+        self.btn_start_spatial.setEnabled(not locked)
+        self.btn_stop_spatial.setEnabled(locked)
+        self.btn_xy_calibrate.setEnabled(not locked)
+
+    def _on_spatial_progress(self, text: str, current: int, total: int, placement: object) -> None:
+        self.progress.setMaximum(max(1, total))
+        self.progress.setValue(current)
+        if placement is not None:
+            plan = self._survey_plan if text == "概览扫描" else self._acquisition_plan
+            basis = self._survey_plan or plan
+            if basis is not None:
+                self.spatial_map.set_current_scan_point(
+                    self._stage_point_to_map(basis, placement.target.x_mm, placement.target.y_mm)
+                )
+
+    def _on_spatial_tile(self, placement: object, sample: object, actual: object) -> None:
+        if self._survey_plan is None or self._spatial_composer is None:
+            return
+        frame = sample.frame
+        rect = self._stage_rect_to_map(self._survey_plan, placement.bounds)
+        clipped = rect.intersected(QRect(0, 0, self._spatial_map_shape[1], self._spatial_map_shape[0]))
+        if clipped.isEmpty():
+            return
+        display = frame
+        if display.dtype == np.uint16:
+            display = ((np.clip(display, 0, 4095).astype(np.uint32) * 255) // 4095).astype(np.uint8)
+        else:
+            display = display.astype(np.uint8, copy=False)
+        resized = cv2.resize(display, (max(1, rect.width()), max(1, rect.height())), interpolation=cv2.INTER_AREA)
+        origin = (float(rect.x()), float(rect.y()))
+        quality = 1.0
+        previous = self._last_spatial_tile
+        if previous is not None:
+            previous_placement, previous_frame = previous
+            row_delta = placement.row - previous_placement.row
+            column_delta = placement.column - previous_placement.column
+            direction = None
+            if row_delta == 0 and column_delta == 1:
+                direction = "right"
+            elif row_delta == 0 and column_delta == -1:
+                direction = "left"
+            elif abs(row_delta) == 1 and column_delta == 0:
+                direction = "down" if row_delta > 0 else "up"
+            if direction is not None:
+                registration = estimate_adjacent_translation(
+                    previous_frame,
+                    frame,
+                    direction=direction,
+                    overlap=self.spatial_overlap.value() / 100.0,
+                )
+                quality = max(0.05, registration.confidence) if registration.success else 0.25
+                previous_origin = self._spatial_tile_origins.get(previous_placement.sequence)
+                if registration.success and previous_origin is not None:
+                    sx = rect.width() / max(frame.shape[1], 1)
+                    sy = rect.height() / max(frame.shape[0], 1)
+                    origin = (
+                        previous_origin[0] + registration.dx_px * sx,
+                        previous_origin[1] + registration.dy_px * sy,
+                    )
+        self._spatial_composer.add_tile(resized, origin, quality=quality)
+        self._spatial_tile_origins[placement.sequence] = origin
+        self._last_spatial_tile = (placement, frame.copy())
+        tile_id = f"{placement.row}:{placement.column}"
+        try:
+            self.spatial_map.update_tile_state(tile_id, "complete")
+        except KeyError:
+            pass
+        self._map_image_from_composer()
+
+    def _on_spatial_done(self, result: object, exc: object) -> None:
+        self._restore_pzt_monitor_after_scan()
+        self._set_spatial_locked(False)
+        self.spatial_map.set_current_scan_point(None)
+        if exc is not None:
+            self._show_error("空间扫描错误", exc if isinstance(exc, Exception) else RuntimeError(str(exc)))
+            return
+        scan_result = result if isinstance(result, SpatialScanResult) else None
+        if scan_result is None:
+            return
+        if scan_result.survey and self._spatial_composer is not None:
+            try:
+                SpatialJobStorage(scan_result.folder).save_preview(
+                    self._spatial_composer.image(np.dtype(np.uint8))
+                )
+            except Exception as preview_error:
+                self._log(f"空间概览图保存失败: {preview_error}")
+        state = "已停止" if scan_result.stopped else "完成"
+        self._log(
+            f"{'概览' if scan_result.survey else '空间纵向'}扫描{state}: "
+            f"{scan_result.completed_tiles}/{scan_result.total_tiles} 瓦片，目录 {scan_result.folder}"
+        )
+
 
     def _toggle_pzt(self) -> None:
         try:
@@ -2218,6 +3170,8 @@ class MainWindow(QMainWindow):
                 raise RuntimeError("请先连接相机")
             if not self.pzt.connected:
                 raise RuntimeError("请先连接 PZT")
+            if self.xy_settings_dialog.task_locked:
+                raise RuntimeError("XY 位移台已有自动任务在运行")
             save_dir = Path(self.save_path.text())
             save_dir.mkdir(parents=True, exist_ok=True)
             if self.trigger_mode.currentText() == "软触发" and self.preview_timer.isActive():
@@ -2334,6 +3288,7 @@ class MainWindow(QMainWindow):
 
     def _set_scan_locked(self, locked: bool) -> None:
         enabled = not locked
+        self.xy_settings_dialog.set_scan_active(locked)
         for widget in (
             self.btn_camera_open,
             self.btn_preview,
@@ -2373,6 +3328,23 @@ class MainWindow(QMainWindow):
             self.gamma_slider,
             self.saturation_slider,
             self.sharpness_slider,
+            self.btn_start_survey,
+            self.btn_select_spatial_roi,
+            self.btn_plan_spatial,
+            self.btn_start_spatial,
+            self.survey_x_start,
+            self.survey_x_end,
+            self.survey_y_start,
+            self.survey_y_end,
+            self.spatial_pixel_um,
+            self.spatial_overlap,
+            self.spatial_settle,
+            self.spatial_route,
+            self.btn_xy_calibrate,
+            self.xy_safe_x_min,
+            self.xy_safe_x_max,
+            self.xy_safe_y_min,
+            self.xy_safe_y_max,
         ):
             widget.setEnabled(enabled)
         if not locked:
@@ -2419,6 +3391,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error("相机设置失败", exc)
 
+    def _camera_geometry_changed(self, func) -> None:
+        self._safe_camera_call(func)
+        self._invalidate_calibration("图像方向已变化")
+
     def _log(self, text: str) -> None:
         self.bridge.log.emit(text)
 
@@ -2430,10 +3406,19 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, title, str(exc))
 
     def closeEvent(self, event) -> None:
+        if self.spatial_worker is not None:
+            self.spatial_worker.stop()
         self.scanner.stop()
         self.preview_timer.stop()
         self.monitor_timer.stop()
         self.status_timer.stop()
+        self.xy_status_timer.stop()
         self.pzt.close()
+        self.xy_settings_dialog.close()
+        self.xy_overview_dialog.close()
+        if self.xy_stage is not None:
+            self.xy_stage.close()
+            self.xy_stage = None
+        self.xy_settings_dialog.set_executor(None)
         self.camera.close()
         event.accept()

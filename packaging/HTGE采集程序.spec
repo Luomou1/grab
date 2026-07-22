@@ -17,12 +17,22 @@ if os.environ.get("HTGE_INCLUDE_SDK", "1") != "0":
         for dll_path in sdk_dir.glob("*.dll"):
             sdk_binaries.append((str(dll_path), "grab_app/camera"))
 
+xy_stage_dir = project_root / "grab_app" / "xy_stage"
+xy_vendor_dir = xy_stage_dir / "vendor" / "x64"
+for dll_name in ("zauxdll.dll", "zmotion.dll"):
+    dll_path = xy_vendor_dir / dll_name
+    if dll_path.exists():
+        sdk_binaries.append((str(dll_path), "grab_app/xy_stage/vendor/x64"))
+
 datas = []
 readme = project_root / "README.md"
 if readme.exists():
     datas.append((str(readme), "."))
 if icon_path.exists():
     datas.append((str(icon_path), "assets"))
+xy_profile = xy_stage_dir / "device_profile.json"
+if xy_profile.exists():
+    datas.append((str(xy_profile), "grab_app/xy_stage"))
 
 
 a = Analysis(
