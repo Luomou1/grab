@@ -6,6 +6,7 @@ import pytest
 from grab_app.spatial import (
     SpatialCalibration,
     SpatialRect,
+    StagePoint,
     default_calibration,
     plan_center_scan,
     plan_tiles,
@@ -90,6 +91,60 @@ def test_center_scan_supports_single_row() -> None:
     assert plan.rows == 1
     assert plan.columns > 1
     assert {item.target.y_mm for item in plan.placements} == {3.0}
+
+
+def test_center_scan_keeps_absolute_dpos_start_and_end_independent_of_route_order() -> None:
+    plan = plan_center_scan(
+        -2.0, 2.0, -3.0, -2.7,
+        (1280, 1024), default_calibration(),
+        route="serpentine",
+        safety_limits=SafetyLimits(-10.0, 10.0, -10.0, 10.0),
+    )
+
+    assert plan.rows == 2
+    assert plan.start_target.as_tuple() == pytest.approx((-2.0, -3.0))
+    assert plan.end_target.as_tuple() == pytest.approx((2.0, -2.7))
+    assert plan.placements[-1].target.as_tuple() != pytest.approx(
+        plan.end_target.as_tuple()
+    )
+
+
+def test_center_scan_reports_actual_per_axis_overlap_after_integer_rounding() -> None:
+    limits = SafetyLimits(-10.0, 10.0, -10.0, 10.0)
+    plan_20 = plan_center_scan(
+        1.902, 3.902, 0.4018, -0.2782,
+        (1280, 1024), default_calibration(0.48), 0.20,
+        safety_limits=limits,
+    )
+    plan_10 = plan_center_scan(
+        1.902, 3.902, 0.4018, -0.2782,
+        (1280, 1024), default_calibration(0.48), 0.10,
+        safety_limits=limits,
+    )
+
+    assert (plan_20.columns, plan_20.rows) == (6, 3)
+    assert (plan_10.columns, plan_10.rows) == (5, 3)
+    assert plan_20.effective_overlap_xy == pytest.approx(
+        (0.3489583333, 0.3082682292)
+    )
+    assert plan_10.effective_overlap_xy == pytest.approx(
+        (0.1861979167, 0.3082682292)
+    )
+
+
+def test_tile_bounds_can_use_actual_dpos_as_captured_view_center() -> None:
+    plan = plan_center_scan(
+        0.0, 0.0, 0.0, 0.0,
+        (1280, 1024), default_calibration(),
+        safety_limits=SafetyLimits(-10.0, 10.0, -10.0, 10.0),
+    )
+    placement = plan.placements[0]
+
+    actual_bounds = placement.bounds_at_center(StagePoint(0.125, -0.25))
+
+    assert actual_bounds.center.as_tuple() == pytest.approx((0.125, -0.25))
+    assert actual_bounds.width_mm == pytest.approx(placement.bounds.width_mm)
+    assert actual_bounds.height_mm == pytest.approx(placement.bounds.height_mm)
 
 
 def test_center_scan_uses_controller_limits_without_camera_half_frame_inset() -> None:

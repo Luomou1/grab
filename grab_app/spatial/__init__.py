@@ -20,7 +20,13 @@ from .calibration import (
     validate_calibration_quality,
 )
 from .planner import SafetyLimits, frame_footprint_mm, plan_center_scan, plan_grid, plan_tiles
-from .registration import RegistrationResult, estimate_adjacent_translation, estimate_translation
+from .registration import (
+    RegistrationResult,
+    bounded_registration_correction,
+    estimate_adjacent_translation,
+    estimate_translation,
+    expected_adjacent_translation,
+)
 from .composer import MosaicComposer, RealtimeMosaicComposer
 from .storage import (
     SpatialJobStorage,
@@ -36,7 +42,7 @@ __all__ = [
     "fit_affine", "fit_affine_calibration", "pixel_to_stage", "stage_to_pixel",
     "validate_calibration_quality",
     "SafetyLimits", "frame_footprint_mm", "plan_center_scan", "plan_grid", "plan_tiles", "RegistrationResult",
-    "estimate_adjacent_translation", "estimate_translation", "MosaicComposer",
-    "RealtimeMosaicComposer", "SpatialJobStorage", "atomic_write_json", "write_json_atomic",
-    "create_job_directory",
+    "bounded_registration_correction", "estimate_adjacent_translation", "estimate_translation",
+    "expected_adjacent_translation", "MosaicComposer", "RealtimeMosaicComposer",
+    "SpatialJobStorage", "atomic_write_json", "write_json_atomic", "create_job_directory",
 ]

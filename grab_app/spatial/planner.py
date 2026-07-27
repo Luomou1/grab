@@ -180,7 +180,7 @@ def plan_center_scan(
     route: str = "serpentine",
     safety_limits: SafetyLimits | SpatialRect | None,
 ) -> TilePlan:
-    """按相机中心坐标规划概览扫描，支持单行、单列和负用户坐标。"""
+    """按绝对 DPOS 视野中心规划概览，支持单行、单列和负坐标。"""
     if not 0.1 <= overlap <= 0.4:
         raise ValueError("overlap 必须位于 [0.1, 0.4] 范围")
     if route not in {"serpentine", "unidirectional"}:

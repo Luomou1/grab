@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from grab_app.spatial import MosaicComposer, estimate_adjacent_translation
+import grab_app.spatial.registration as registration
 
 
 def test_phase_correlation_uses_expected_horizontal_overlap() -> None:
@@ -28,6 +29,34 @@ def test_phase_correlation_safely_falls_back_for_blank_tiles() -> None:
     assert result.used_fallback
     assert result.translation_px == (75.0, 0.0)
     assert result.confidence == 0.0
+
+
+def test_bounded_registration_correction_returns_only_residual_from_dpos_prior() -> None:
+    result = registration.RegistrationResult(78.0, 1.5, 0.8, True)
+
+    correction = registration.bounded_registration_correction(
+        result,
+        frame_shape=(80, 100),
+        direction="right",
+        overlap=0.20,
+        max_correction_px=5.0,
+    )
+
+    assert correction == pytest.approx((-2.0, 1.5))
+
+
+def test_bounded_registration_correction_rejects_period_jump() -> None:
+    false_period_match = registration.RegistrationResult(40.0, 0.0, 0.9, True)
+
+    correction = registration.bounded_registration_correction(
+        false_period_match,
+        frame_shape=(80, 100),
+        direction="right",
+        overlap=0.20,
+        max_correction_px=8.0,
+    )
+
+    assert correction is None
 
 
 def test_feather_composer_tracks_canvas_coverage_and_quality() -> None:

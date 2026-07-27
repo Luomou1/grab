@@ -6,11 +6,18 @@ import sys
 import types
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
 from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton
 
-from grab_app.spatial import SpatialRect
+from grab_app.spatial import (
+    RegistrationResult,
+    SpatialRect,
+    StagePoint,
+    expected_adjacent_translation,
+)
 from grab_app.xy_stage import AxisStatus, DeviceSnapshot
 
 
@@ -60,6 +67,18 @@ def test_main_window_builds_spatial_map_and_plans_tiles() -> None:
             "像素间距 (µm/px)", "重叠率", "稳定时间", "概览路径"
         }
         assert not window.xy_overview_dialog.findChildren(QPushButton)
+        spatial_labels = {
+            label.text()
+            for label in window.findChildren(QLabel)
+            if label.objectName() == "fieldLabel"
+        }
+        assert {"X 起点", "X 终点", "Y 起点", "Y 终点"} <= spatial_labels
+        assert "DPOS" in window.survey_x_start.toolTip()
+        assert "视野中心" in window.xy_realtime_position.toolTip()
+        assert window.show_tile_borders.isChecked()
+        assert window.spatial_map.tile_borders_visible
+        window.show_tile_borders.setChecked(False)
+        assert not window.spatial_map.tile_borders_visible
     finally:
         window.camera.h_camera = None
         window.close()
@@ -198,5 +217,181 @@ def test_xy_spatial_control_tab_stays_compact_when_dialog_is_tall() -> None:
         assert window.xy_safe_y_min.y() - window.xy_safe_x_min.y() < 80
         assert window.btn_xy_calibrate.y() - window.xy_safe_y_min.y() < 80
     finally:
+        window.close()
+        app.processEvents()
+
+
+def test_sample_map_draws_higher_absolute_dpos_y_above_lower_y() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    MainWindow = _import_main_window_without_update_file()
+    window = MainWindow()
+    try:
+        window.camera.h_camera = object()
+        window.camera.width = 1280
+        window.camera.height = 1024
+        window.xy_safe_y_min.setValue(-1.0)
+        window.survey_x_start.setValue(1.0)
+        window.survey_x_end.setValue(2.0)
+        window.survey_y_start.setValue(0.4)
+        window.survey_y_end.setValue(-0.2)
+        plan = window._plan_spatial_center_scan()
+        window._prepare_spatial_map(plan)
+
+        start = window._stage_point_to_map(
+            plan, plan.start_target.x_mm, plan.start_target.y_mm
+        )
+        end = window._stage_point_to_map(
+            plan, plan.end_target.x_mm, plan.end_target.y_mm
+        )
+
+        assert plan.start_target.y_mm > plan.end_target.y_mm
+        assert start.y() < end.y()
+    finally:
+        window.camera.h_camera = None
+        window.close()
+        app.processEvents()
+
+
+def test_horizontal_mirror_checkbox_reverses_default_camera_correction() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    MainWindow = _import_main_window_without_update_file()
+    window = MainWindow()
+    calls: list[tuple[int, bool]] = []
+    try:
+        window.camera.h_camera = object()
+        window.camera.set_mirror = lambda direction, enabled: calls.append(
+            (direction, enabled)
+        )
+
+        assert not window.h_mirror.isChecked()
+        window._apply_camera_orientation()
+        assert calls[-1] == (0, True)
+
+        window.h_mirror.setChecked(True)
+        app.processEvents()
+        assert calls[-1] == (0, False)
+
+        window.h_mirror.setChecked(False)
+        app.processEvents()
+        assert calls[-1] == (0, True)
+    finally:
+        window.camera.h_camera = None
+        window.close()
+        app.processEvents()
+
+
+def test_open_camera_applies_horizontal_correction_with_unchecked_ui() -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    MainWindow = _import_main_window_without_update_file()
+    window = MainWindow()
+
+    class FakeCamera:
+        initialized = False
+        width = 1280
+        height = 1024
+
+        def __init__(self) -> None:
+            self.mirror_calls: list[tuple[int, bool]] = []
+
+        def open(self) -> None:
+            self.initialized = True
+
+        def set_mirror(self, direction: int, enabled: bool) -> None:
+            self.mirror_calls.append((direction, enabled))
+
+        def close(self) -> None:
+            self.initialized = False
+
+    camera = FakeCamera()
+    try:
+        window.camera = camera
+        window._refresh_camera_capabilities = lambda: None
+        window._apply_current_bit_depth = lambda: None
+
+        window._open_camera()
+
+        assert not window.h_mirror.isChecked()
+        assert camera.mirror_calls == [(0, True)]
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_live_mosaic_uses_effective_overlap_and_dpos_anchored_correction(
+    monkeypatch,
+) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    MainWindow = _import_main_window_without_update_file()
+    module = sys.modules[MainWindow.__module__]
+    window = MainWindow()
+
+    class CaptureComposer:
+        def __init__(self, shape: tuple[int, int]) -> None:
+            self.shape = shape
+            self.origins: list[tuple[float, float]] = []
+
+        def add_tile(self, _tile, origin, *, quality=1.0) -> bool:
+            self.origins.append((float(origin[0]), float(origin[1])))
+            return True
+
+        def image(self, dtype=np.dtype(np.uint8)) -> np.ndarray:
+            return np.zeros(self.shape, dtype=dtype)
+
+    registration_calls: list[tuple[str, float]] = []
+
+    def fake_registration(reference, moving, *, direction, overlap, min_confidence=0.1):
+        registration_calls.append((direction, overlap))
+        expected_x, expected_y = expected_adjacent_translation(
+            reference.shape[:2], direction, overlap
+        )
+        return RegistrationResult(expected_x + 2.0, expected_y + 1.0, 0.9, True)
+
+    try:
+        window.camera.h_camera = object()
+        window.camera.width = 1280
+        window.camera.height = 1024
+        window.xy_safe_y_min.setValue(-1.0)
+        window.survey_x_start.setValue(1.902)
+        window.survey_x_end.setValue(3.902)
+        window.survey_y_start.setValue(0.4018)
+        window.survey_y_end.setValue(-0.2782)
+        plan = window._plan_spatial_center_scan()
+        assert (plan.rows, plan.columns) == (3, 6)
+        window._survey_plan = plan
+        window._prepare_spatial_map(plan)
+        composer = CaptureComposer(window._spatial_map_shape)
+        window._spatial_composer = composer
+        monkeypatch.setattr(module, "estimate_adjacent_translation", fake_registration)
+        assert window.spatial_effective_overlap.text() == (
+            "有效重叠: X=34.90%  Y=30.83%"
+        )
+        frame = np.arange(80 * 100, dtype=np.uint8).reshape(80, 100)
+        sample = SimpleNamespace(frame=frame)
+
+        for placement in plan.placements:
+            window._on_spatial_tile(
+                placement, sample, placement.target.as_tuple()
+            )
+
+        effective_x, effective_y = plan.effective_overlap_xy
+        assert registration_calls
+        for direction, overlap in registration_calls:
+            expected = effective_x if direction in {"left", "right"} else effective_y
+            assert overlap == pytest.approx(expected)
+        last = plan.placements[-1]
+        anchored_rect = window._stage_rect_to_map(
+            plan, last.bounds_at_center(StagePoint(*last.target.as_tuple()))
+        )
+        expected_origin = (
+            anchored_rect.x() + 2.0 * anchored_rect.width() / frame.shape[1],
+            anchored_rect.y() + 1.0 * anchored_rect.height() / frame.shape[0],
+        )
+        assert composer.origins[-1] == pytest.approx(expected_origin)
+    finally:
+        window.camera.h_camera = None
         window.close()
         app.processEvents()

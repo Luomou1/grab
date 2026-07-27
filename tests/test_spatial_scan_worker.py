@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import threading
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from grab_app.camera import CameraFrame
 from grab_app.services.scanner import ScanConfig, ScanResult
@@ -12,7 +14,13 @@ from grab_app.services.spatial_scan import (
     SpatialScanWorker,
     SurveyConfig,
 )
-from grab_app.spatial import SafetyLimits, SpatialRect, default_calibration, plan_tiles
+from grab_app.spatial import (
+    SafetyLimits,
+    SpatialRect,
+    default_calibration,
+    plan_center_scan,
+    plan_tiles,
+)
 
 
 class FakeCamera:
@@ -107,6 +115,47 @@ def test_survey_moves_captures_saves_and_restores_trigger(tmp_path: Path) -> Non
     assert (result.folder / "survey" / "tile_index.csv").exists()
 
 
+def test_survey_saves_actual_dpos_as_captured_view_center(tmp_path: Path) -> None:
+    calibration, plan = _plan(SpatialRect(1.0, 1.0, 1.2, 1.2))
+
+    class FeedbackStage(FakeStage):
+        def move_absolute_blocking(
+            self, x_mm: float, y_mm: float, **_: object
+        ) -> tuple[float, float]:
+            self.moves.append((x_mm, y_mm))
+            return x_mm + 0.001, y_mm - 0.002
+
+    camera, scanner, stage = FakeCamera(), FakeScanner(), FeedbackStage()
+    actual_centers: list[tuple[float, float]] = []
+    worker = SpatialScanWorker(
+        camera,
+        scanner,
+        stage,
+        lambda *_: None,
+        lambda _placement, _sample, actual: actual_centers.append(actual),
+        lambda *_: None,
+    )
+
+    result = worker._run_survey(
+        SurveyConfig(
+            plan, tmp_path, extension="tiff", bit_depth=8,
+            settle_ms=0, calibration=calibration,
+        )
+    )
+
+    with (result.folder / "survey" / "tile_index.csv").open(
+        "r", encoding="utf-8", newline=""
+    ) as handle:
+        row = next(csv.DictReader(handle))
+    expected = (
+        plan.placements[0].target.x_mm + 0.001,
+        plan.placements[0].target.y_mm - 0.002,
+    )
+    assert actual_centers[0] == pytest.approx(expected)
+    assert float(row["actual_x_mm"]) == pytest.approx(expected[0])
+    assert float(row["actual_y_mm"]) == pytest.approx(expected[1])
+
+
 def test_spatial_acquisition_runs_one_pzt_scan_per_xy_tile(tmp_path: Path) -> None:
     _, plan = _plan(SpatialRect(1.0, 1.0, 2.0, 1.4))
     camera, scanner, stage, tiles = FakeCamera(), FakeScanner(), FakeStage(), []
@@ -131,3 +180,83 @@ def test_stop_sets_all_device_cancellation_paths() -> None:
     worker.stop()
     assert scanner.stopped
     assert stage.stops == 1
+
+
+def _even_row_center_plan():
+    calibration = default_calibration(0.48)
+    plan = plan_center_scan(
+        -2.0, 2.0, -3.0, -2.7,
+        (1280, 1024), calibration,
+        route="serpentine",
+        safety_limits=SafetyLimits(-10.0, 10.0, -10.0, 10.0),
+    )
+    assert plan.rows == 2
+    return calibration, plan
+
+
+def test_survey_finishes_at_requested_absolute_dpos_end_corner(tmp_path: Path) -> None:
+    calibration, plan = _even_row_center_plan()
+    camera, scanner, stage, tiles = FakeCamera(), FakeScanner(), FakeStage(), []
+    worker = _worker(camera, scanner, stage, tiles)
+
+    worker._run_survey(
+        SurveyConfig(
+            plan, tmp_path, extension="tiff", bit_depth=8,
+            settle_ms=0, calibration=calibration,
+        )
+    )
+
+    assert stage.moves[0] == pytest.approx((-2.0, -3.0))
+    assert stage.moves[-1] == pytest.approx((2.0, -2.7))
+    assert len(stage.moves) == plan.tile_count + 1
+
+
+def test_spatial_acquisition_finishes_at_requested_absolute_dpos_end_corner(
+    tmp_path: Path,
+) -> None:
+    _, plan = _even_row_center_plan()
+    camera, scanner, stage, tiles = FakeCamera(), FakeScanner(), FakeStage(), []
+    worker = _worker(camera, scanner, stage, tiles)
+    pzt = ScanConfig(
+        mode="normal", channel=0, start_um=0, end_um=1, step_um=0.5,
+        stable_ms=0, repeats=1, trigger_mode="soft", save_dir=tmp_path,
+        prefix="img", extension="tiff", bit_depth=8,
+    )
+
+    worker._run_acquisition(
+        SpatialAcquisitionConfig(plan, pzt, tmp_path, settle_ms=0)
+    )
+
+    assert stage.moves[0] == pytest.approx((-2.0, -3.0))
+    assert stage.moves[-1] == pytest.approx((2.0, -2.7))
+    assert len(stage.moves) == plan.tile_count + 1
+
+
+def test_stopped_final_pzt_tile_does_not_reposition_to_scan_end(tmp_path: Path) -> None:
+    _, plan = _even_row_center_plan()
+
+    class StopsOnLastScanner(FakeScanner):
+        def run_sync(self, config: ScanConfig) -> ScanResult:
+            result = super().run_sync(config)
+            return ScanResult(
+                result.folder,
+                completed_images=result.completed_images,
+                stopped=len(self.configs) == plan.tile_count,
+                saved_images=result.saved_images,
+            )
+
+    camera, scanner, stage, tiles = FakeCamera(), StopsOnLastScanner(), FakeStage(), []
+    worker = _worker(camera, scanner, stage, tiles)
+    pzt = ScanConfig(
+        mode="normal", channel=0, start_um=0, end_um=1, step_um=0.5,
+        stable_ms=0, repeats=1, trigger_mode="soft", save_dir=tmp_path,
+        prefix="img", extension="tiff", bit_depth=8,
+    )
+
+    result = worker._run_acquisition(
+        SpatialAcquisitionConfig(plan, pzt, tmp_path, settle_ms=0)
+    )
+
+    assert result.stopped
+    assert len(stage.moves) == plan.tile_count
+    assert stage.moves[-1] == pytest.approx(plan.placements[-1].target.as_tuple())

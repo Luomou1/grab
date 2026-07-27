@@ -69,7 +69,9 @@ from grab_app.spatial import (
     SafetyLimits,
     SpatialJobStorage,
     SpatialRect,
+    StagePoint,
     TilePlan,
+    bounded_registration_correction,
     default_calibration,
     estimate_adjacent_translation,
     fit_affine_calibration,
@@ -580,7 +582,9 @@ class MainWindow(QMainWindow):
         self._spatial_map_shape = (0, 0)
         self._spatial_tile_states: dict[str, SpatialTile] = {}
         self._spatial_tile_origins: dict[int, tuple[float, float]] = {}
-        self._last_spatial_tile: tuple[object, np.ndarray] | None = None
+        self._last_spatial_tile: (
+            tuple[object, np.ndarray, tuple[float, float], tuple[float, float]] | None
+        ) = None
 
         self.bridge.progress.connect(self._on_scan_progress)
         self.bridge.done.connect(self._on_scan_done)
@@ -843,7 +847,7 @@ class MainWindow(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(side_widget)
-        # 四列参数区包含“中心起点/终点”等较长标签，留足宽度避免右列被裁切。
+        # 四列参数区留足宽度，避免 X/Y 绝对 DPOS 起终点被裁切。
         scroll.setFixedWidth(430)
 
         root_layout.addWidget(left_area, 1)
@@ -967,6 +971,10 @@ class MainWindow(QMainWindow):
 
         transform_row = QHBoxLayout()
         self.h_mirror = QCheckBox("水平镜像")
+        self.h_mirror.setChecked(False)
+        self.h_mirror.setToolTip(
+            "未勾选时使用默认水平校正；勾选后在校正画面基础上水平反转。"
+        )
         self.v_mirror = QCheckBox("垂直镜像")
         self.rotate = self._combo(["0°", "90°", "180°", "270°"], "0°")
         transform_row.addWidget(self.h_mirror)
@@ -997,9 +1005,7 @@ class MainWindow(QMainWindow):
         self.anti_flick.toggled.connect(self._anti_flick_changed)
         self.light_frequency.currentTextChanged.connect(self._light_frequency_changed)
         self.btn_once_wb.clicked.connect(lambda: self._safe_camera_call(self.camera.set_once_white_balance))
-        self.h_mirror.toggled.connect(
-            lambda v: self._camera_geometry_changed(lambda: self.camera.set_mirror(0, v))
-        )
+        self.h_mirror.toggled.connect(self._horizontal_mirror_changed)
         self.v_mirror.toggled.connect(
             lambda v: self._camera_geometry_changed(lambda: self.camera.set_mirror(1, v))
         )
@@ -1163,6 +1169,9 @@ class MainWindow(QMainWindow):
         )
         self.xy_realtime_position = QLabel("X=-- mm  Y=-- mm")
         self.xy_realtime_position.setObjectName("xyRealtimePosition")
+        self.xy_realtime_position.setToolTip(
+            "控制器当前实际 DPOS，也是当前相机视野中心的绝对坐标。"
+        )
         self.xy_axis_lamps = {0: StatusLamp("X"), 1: StatusLamp("Y")}
         header.addWidget(self.btn_xy_section_title)
         header.addWidget(self.xy_realtime_position)
@@ -1175,8 +1184,24 @@ class MainWindow(QMainWindow):
         self.survey_x_end = self._dspin(-1000, 1000, 2.0, 4, 0.1)
         self.survey_y_start = self._dspin(-1000, 1000, 1.0, 4, 0.1)
         self.survey_y_end = self._dspin(-1000, 1000, 2.0, 4, 0.1)
+        dpos_hint = "控制器绝对 DPOS；到位后该坐标就是相机视野中心。"
+        for widget in (
+            self.survey_x_start,
+            self.survey_x_end,
+            self.survey_y_start,
+            self.survey_y_end,
+        ):
+            widget.setToolTip(dpos_hint)
         self.spatial_roi_status = QLabel("空间 ROI: 未选择")
         self.spatial_roi_status.setWordWrap(True)
+        self.spatial_effective_overlap = QLabel("有效重叠: 规划后显示")
+        self.spatial_effective_overlap.setToolTip(
+            "根据扫描跨度、整数行列数和相机视场计算；X、Y 可能不同。"
+        )
+        self.show_tile_borders = QCheckBox("显示瓦片边框")
+        self.show_tile_borders.setChecked(True)
+        self.spatial_map.set_tile_borders_visible(True)
+        self.show_tile_borders.setToolTip("显示或隐藏样品地图上的瓦片状态边框")
         self.btn_start_survey = QPushButton("概览扫描")
         self.btn_select_spatial_roi = QPushButton("框选区域")
         self.btn_plan_spatial = QPushButton("规划")
@@ -1190,8 +1215,8 @@ class MainWindow(QMainWindow):
         self.btn_stop_spatial.setEnabled(False)
 
         fields = (
-            ("X 中心起点", self.survey_x_start, "X 中心终点", self.survey_x_end),
-            ("Y 中心起点", self.survey_y_start, "Y 中心终点", self.survey_y_end),
+            ("X 起点", self.survey_x_start, "X 终点", self.survey_x_end),
+            ("Y 起点", self.survey_y_start, "Y 终点", self.survey_y_end),
         )
         for row, (left_text, left, right_text, right) in enumerate(fields, start=1):
             layout.addWidget(self._label(left_text), row, 0)
@@ -1199,11 +1224,18 @@ class MainWindow(QMainWindow):
             layout.addWidget(self._label(right_text), row, 2)
             layout.addWidget(right, row, 3)
         layout.addWidget(self.spatial_roi_status, 3, 0, 1, 4)
-        layout.addWidget(self.btn_start_survey, 4, 0, 1, 2)
-        layout.addWidget(self.btn_select_spatial_roi, 4, 2, 1, 2)
-        layout.addWidget(self.btn_plan_spatial, 5, 0)
-        layout.addWidget(self.btn_start_spatial, 5, 1, 1, 2)
-        layout.addWidget(self.btn_stop_spatial, 5, 3)
+        map_display_row = QHBoxLayout()
+        map_display_row.setContentsMargins(0, 0, 0, 0)
+        map_display_row.setSpacing(6)
+        map_display_row.addWidget(self.spatial_effective_overlap)
+        map_display_row.addStretch(1)
+        map_display_row.addWidget(self.show_tile_borders)
+        layout.addLayout(map_display_row, 4, 0, 1, 4)
+        layout.addWidget(self.btn_start_survey, 5, 0, 1, 2)
+        layout.addWidget(self.btn_select_spatial_roi, 5, 2, 1, 2)
+        layout.addWidget(self.btn_plan_spatial, 6, 0)
+        layout.addWidget(self.btn_start_spatial, 6, 1, 1, 2)
+        layout.addWidget(self.btn_stop_spatial, 6, 3)
 
         self.btn_start_survey.clicked.connect(self._start_spatial_survey)
         self.btn_select_spatial_roi.clicked.connect(self._activate_spatial_selection)
@@ -1211,6 +1243,14 @@ class MainWindow(QMainWindow):
         self.btn_start_spatial.clicked.connect(self._start_spatial_acquisition)
         self.btn_stop_spatial.clicked.connect(self._stop_spatial_scan)
         self.spatial_pixel_um.editingFinished.connect(self._spatial_pixel_size_changed)
+        self.spatial_overlap.valueChanged.connect(
+            lambda _value: self.spatial_effective_overlap.setText(
+                "有效重叠: 重新规划后更新"
+            )
+        )
+        self.show_tile_borders.toggled.connect(
+            self.spatial_map.set_tile_borders_visible
+        )
         return box
 
     def _pzt_box(self) -> QFrame:
@@ -2075,6 +2115,7 @@ class MainWindow(QMainWindow):
     def _open_camera(self) -> None:
         try:
             self.camera.open()
+            self._apply_camera_orientation()
             self._refresh_camera_capabilities()
             self._apply_current_bit_depth()
             self.camera_status.setText(f"相机: 已连接 {self.camera.width}x{self.camera.height}")
@@ -2784,6 +2825,7 @@ class MainWindow(QMainWindow):
         self._acquisition_plan = None
         self._spatial_roi = None
         self.spatial_roi_status.setText("空间 ROI: 像素间距已变化，请重新概览")
+        self.spatial_effective_overlap.setText("有效重叠: 重新规划后更新")
         self._update_spatial_center_ranges()
         self._log(f"空间像素间距已设为 {self.spatial_pixel_um.value():.6f} µm/px")
 
@@ -2860,28 +2902,41 @@ class MainWindow(QMainWindow):
         self._spatial_tile_states = {tile.tile_id: tile for tile in tile_states}
         self._spatial_tile_origins.clear()
         self._last_spatial_tile = None
+        self._update_spatial_effective_overlap(plan)
         self.viewer_tabs.setCurrentIndex(1)
 
-    def _stage_point_to_map(self, plan: TilePlan, x_mm: float, y_mm: float) -> QPointF:
-        height, width = self._spatial_map_shape
-        return QPointF(
-            (x_mm - plan.roi.x_min_mm) / max(plan.roi.width_mm, 1e-9) * width,
-            (y_mm - plan.roi.y_min_mm) / max(plan.roi.height_mm, 1e-9) * height,
+    def _update_spatial_effective_overlap(self, plan: TilePlan) -> None:
+        overlap_x, overlap_y = plan.effective_overlap_xy
+        x_text = f"{overlap_x * 100:.2f}%" if plan.columns > 1 else "单列"
+        y_text = f"{overlap_y * 100:.2f}%" if plan.rows > 1 else "单行"
+        self.spatial_effective_overlap.setText(
+            f"有效重叠: X={x_text}  Y={y_text}"
         )
 
+    def _stage_point_to_map(self, plan: TilePlan, x_mm: float, y_mm: float) -> QPointF:
+        _ = plan  # 地图模型已经保存同一计划的物理边界。
+        return self.spatial_map.map_sample_point_to_pixel(x_mm, y_mm)
+
     def _stage_rect_to_map(self, plan: TilePlan, rect: SpatialRect) -> QRect:
-        height, width = self._spatial_map_shape
-        x = round((rect.x_min_mm - plan.roi.x_min_mm) / max(plan.roi.width_mm, 1e-9) * width)
-        y = round((rect.y_min_mm - plan.roi.y_min_mm) / max(plan.roi.height_mm, 1e-9) * height)
-        w = max(1, round(rect.width_mm / max(plan.roi.width_mm, 1e-9) * width))
-        h = max(1, round(rect.height_mm / max(plan.roi.height_mm, 1e-9) * height))
-        return QRect(x, y, w, h)
+        _ = plan
+        first = self.spatial_map.map_sample_point_to_pixel(rect.x_min_mm, rect.y_max_mm)
+        second = self.spatial_map.map_sample_point_to_pixel(rect.x_max_mm, rect.y_min_mm)
+        left, right = sorted((first.x(), second.x()))
+        top, bottom = sorted((first.y(), second.y()))
+        return QRect(
+            round(left),
+            round(top),
+            max(1, round(right - left)),
+            max(1, round(bottom - top)),
+        )
 
     def _map_image_from_composer(self) -> None:
         if self._spatial_composer is None:
             return
         image = self._spatial_composer.image(np.dtype(np.uint8))
-        self.spatial_map.set_map_image(frame_to_pixmap(image, image.shape[1], image.shape[0]))
+        self.spatial_map.set_map_image(
+            frame_to_pixmap(image, image.shape[1], image.shape[0])
+        )
 
     def _activate_spatial_selection(self) -> None:
         if self._survey_plan is None:
@@ -2925,7 +2980,9 @@ class MainWindow(QMainWindow):
             self._spatial_tile_states = {tile.tile_id: tile for tile in states}
             self._log(
                 f"空间路径已规划: {self._acquisition_plan.rows}×{self._acquisition_plan.columns}，"
-                f"共 {self._acquisition_plan.tile_count} 个 XY 瓦片"
+                f"共 {self._acquisition_plan.tile_count} 个 XY 瓦片；"
+                f"有效重叠 X={self._acquisition_plan.effective_overlap_xy[0] * 100:.2f}%，"
+                f"Y={self._acquisition_plan.effective_overlap_xy[1] * 100:.2f}%"
             )
         except Exception as exc:
             self._show_error("空间路径规划失败", exc)
@@ -2982,7 +3039,11 @@ class MainWindow(QMainWindow):
                 ),
                 lambda result, exc: self.bridge.spatial_done.emit(result, exc),
             )
-            self._log(f"XY 概览扫描开始: {plan.rows}×{plan.columns}，共 {plan.tile_count} 瓦片")
+            overlap_x, overlap_y = plan.effective_overlap_xy
+            self._log(
+                f"XY 概览扫描开始: {plan.rows}×{plan.columns}，共 {plan.tile_count} 瓦片；"
+                f"有效重叠 X={overlap_x * 100:.2f}%，Y={overlap_y * 100:.2f}%"
+            )
         except Exception as exc:
             self._set_spatial_locked(False)
             self._show_error("概览扫描启动失败", exc)
@@ -3051,49 +3112,75 @@ class MainWindow(QMainWindow):
         if self._survey_plan is None or self._spatial_composer is None:
             return
         frame = sample.frame
-        rect = self._stage_rect_to_map(self._survey_plan, placement.bounds)
-        clipped = rect.intersected(QRect(0, 0, self._spatial_map_shape[1], self._spatial_map_shape[0]))
+        # 控制器实际 DPOS 是捕获图像的唯一视野中心坐标；目标坐标只用于规划。
+        actual_center = (float(actual[0]), float(actual[1]))
+        actual_bounds = placement.bounds_at_center(StagePoint(*actual_center))
+        rect = self._stage_rect_to_map(self._survey_plan, actual_bounds)
+        clipped = rect.intersected(
+            QRect(0, 0, self._spatial_map_shape[1], self._spatial_map_shape[0])
+        )
         if clipped.isEmpty():
             return
         display = frame
         if display.dtype == np.uint16:
-            display = ((np.clip(display, 0, 4095).astype(np.uint32) * 255) // 4095).astype(np.uint8)
+            display = (
+                (np.clip(display, 0, 4095).astype(np.uint32) * 255) // 4095
+            ).astype(np.uint8)
         else:
             display = display.astype(np.uint8, copy=False)
-        resized = cv2.resize(display, (max(1, rect.width()), max(1, rect.height())), interpolation=cv2.INTER_AREA)
-        origin = (float(rect.x()), float(rect.y()))
+        resized = cv2.resize(
+            display,
+            (max(1, rect.width()), max(1, rect.height())),
+            interpolation=cv2.INTER_AREA,
+        )
+        # 每张瓦片都从自身实际 DPOS 重新定位，配准只能施加小残差，不能串联累计。
+        dpos_origin = (float(rect.x()), float(rect.y()))
+        origin = dpos_origin
         quality = 1.0
         previous = self._last_spatial_tile
         if previous is not None:
-            previous_placement, previous_frame = previous
+            previous_placement, previous_frame, previous_actual, previous_dpos_origin = previous
             row_delta = placement.row - previous_placement.row
             column_delta = placement.column - previous_placement.column
             direction = None
-            if row_delta == 0 and column_delta == 1:
-                direction = "right"
-            elif row_delta == 0 and column_delta == -1:
-                direction = "left"
+            overlap = 0.0
+            band_px = 0.0
+            if row_delta == 0 and abs(column_delta) == 1:
+                direction = "right" if dpos_origin[0] > previous_dpos_origin[0] else "left"
+                footprint = self._survey_plan.tile_size_mm[0]
+                overlap = 1.0 - abs(actual_center[0] - previous_actual[0]) / footprint
+                band_px = frame.shape[1] * overlap
             elif abs(row_delta) == 1 and column_delta == 0:
-                direction = "down" if row_delta > 0 else "up"
-            if direction is not None:
+                direction = "down" if dpos_origin[1] > previous_dpos_origin[1] else "up"
+                footprint = self._survey_plan.tile_size_mm[1]
+                overlap = 1.0 - abs(actual_center[1] - previous_actual[1]) / footprint
+                band_px = frame.shape[0] * overlap
+            if direction is not None and 0.0 < overlap < 1.0:
                 registration = estimate_adjacent_translation(
                     previous_frame,
                     frame,
                     direction=direction,
-                    overlap=self.spatial_overlap.value() / 100.0,
+                    overlap=overlap,
+                    min_confidence=0.25,
                 )
-                quality = max(0.05, registration.confidence) if registration.success else 0.25
-                previous_origin = self._spatial_tile_origins.get(previous_placement.sequence)
-                if registration.success and previous_origin is not None:
+                correction = bounded_registration_correction(
+                    registration,
+                    frame_shape=frame.shape[:2],
+                    direction=direction,
+                    overlap=overlap,
+                    max_correction_px=max(2.0, min(12.0, band_px * 0.1)),
+                )
+                if correction is not None:
                     sx = rect.width() / max(frame.shape[1], 1)
                     sy = rect.height() / max(frame.shape[0], 1)
                     origin = (
-                        previous_origin[0] + registration.dx_px * sx,
-                        previous_origin[1] + registration.dy_px * sy,
+                        dpos_origin[0] + correction[0] * sx,
+                        dpos_origin[1] + correction[1] * sy,
                     )
+                    quality = max(0.25, registration.confidence)
         self._spatial_composer.add_tile(resized, origin, quality=quality)
         self._spatial_tile_origins[placement.sequence] = origin
-        self._last_spatial_tile = (placement, frame.copy())
+        self._last_spatial_tile = (placement, frame.copy(), actual_center, dpos_origin)
         tile_id = f"{placement.row}:{placement.column}"
         try:
             self.spatial_map.update_tile_state(tile_id, "complete")
@@ -3123,7 +3210,6 @@ class MainWindow(QMainWindow):
             f"{'概览' if scan_result.survey else '空间纵向'}扫描{state}: "
             f"{scan_result.completed_tiles}/{scan_result.total_tiles} 瓦片，目录 {scan_result.folder}"
         )
-
 
     def _toggle_pzt(self) -> None:
         try:
@@ -3394,6 +3480,17 @@ class MainWindow(QMainWindow):
     def _camera_geometry_changed(self, func) -> None:
         self._safe_camera_call(func)
         self._invalidate_calibration("图像方向已变化")
+
+    def _apply_camera_orientation(self) -> None:
+        """应用默认水平校正；UI 复选框表示在校正结果上额外反转。"""
+        if not self.camera.initialized:
+            return
+        self.camera.set_mirror(0, not self.h_mirror.isChecked())
+
+    def _horizontal_mirror_changed(self, checked: bool) -> None:
+        self._camera_geometry_changed(
+            lambda: self.camera.set_mirror(0, not checked)
+        )
 
     def _log(self, text: str) -> None:
         self.bridge.log.emit(text)

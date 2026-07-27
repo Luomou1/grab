@@ -19,7 +19,7 @@ def _finite(value: float, name: str) -> float:
 
 @dataclass(frozen=True)
 class StagePoint:
-    """位移台样品坐标，单位为 mm。"""
+    """控制器绝对 DPOS，同时作为相机视野中心坐标，单位为 mm。"""
 
     x_mm: float
     y_mm: float
@@ -76,7 +76,7 @@ class SpatialRect:
 
 @dataclass(frozen=True)
 class SpatialCalibration:
-    """二维仿射标定，``pixel = matrix @ stage + offset``。
+    """二维仿射标定，``pixel = matrix @ DPOS + offset``。
 
     ``matrix`` 的单位是 px/mm，``offset`` 的单位是 px。使用嵌套 tuple
     保证状态可直接 JSON 序列化；计算时由 calibration 模块转换为 NumPy 数组。
@@ -131,6 +131,17 @@ class TilePlacement:
     def index(self) -> tuple[int, int]:
         return self.row, self.column
 
+    def bounds_at_center(self, center: StagePoint) -> SpatialRect:
+        """保持视场尺寸不变，将图像边界重定位到实际反馈 DPOS 中心。"""
+        half_width = self.bounds.width_mm / 2.0
+        half_height = self.bounds.height_mm / 2.0
+        return SpatialRect(
+            center.x_mm - half_width,
+            center.y_mm - half_height,
+            center.x_mm + half_width,
+            center.y_mm + half_height,
+        )
+
 
 @dataclass(frozen=True)
 class TilePlan:
@@ -150,3 +161,33 @@ class TilePlan:
     @property
     def tile_count(self) -> int:
         return len(self.placements)
+
+    def _target_at(self, row: int, column: int) -> StagePoint:
+        for placement in self.placements:
+            if placement.row == row and placement.column == column:
+                return placement.target
+        raise ValueError(f"扫描计划缺少网格位置 ({row}, {column})")
+
+    @property
+    def start_target(self) -> StagePoint:
+        """用户定义的绝对 DPOS 起点，不受蛇形执行顺序影响。"""
+        return self._target_at(0, 0)
+
+    @property
+    def end_target(self) -> StagePoint:
+        """用户定义的绝对 DPOS 终点，不受蛇形行数奇偶影响。"""
+        return self._target_at(self.rows - 1, self.columns - 1)
+
+    @property
+    def effective_overlap_xy(self) -> tuple[float, float]:
+        """整数行列规划后的 X/Y 实际重叠率，而不是界面名义值。"""
+        values: list[float] = []
+        for count, spacing, footprint in (
+            (self.columns, self.spacing_mm[0], self.tile_size_mm[0]),
+            (self.rows, self.spacing_mm[1], self.tile_size_mm[1]),
+        ):
+            if count < 2 or footprint <= 0:
+                values.append(0.0)
+            else:
+                values.append(max(0.0, min(1.0, 1.0 - abs(spacing) / footprint)))
+        return values[0], values[1]

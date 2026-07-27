@@ -188,6 +188,11 @@ class SpatialScanWorker:
                 completed = index
                 self._write_state(storage, "running", completed, len(config.plan.placements))
                 self.progress("概览扫描", completed, len(config.plan.placements), placement)
+            self._finish_at_plan_end(
+                config.plan,
+                last_placement=config.plan.placements[-1],
+                timeout_seconds=config.timeout_seconds,
+            )
             self._write_state(storage, "completed", completed, len(config.plan.placements))
             self._save_preview(storage)
             return SpatialScanResult(folder, completed, len(config.plan.placements), False, True)
@@ -210,6 +215,7 @@ class SpatialScanWorker:
         self._write_state(storage, "running", 0, len(config.plan.placements))
         completed = 0
         results: list[ScanResult] = []
+        tile_scan_stopped = False
         try:
             for index, placement in enumerate(config.plan.placements, start=1):
                 self._raise_if_stopped()
@@ -242,14 +248,54 @@ class SpatialScanWorker:
                 self._write_state(storage, "running", completed, len(config.plan.placements))
                 self.progress("空间纵向扫描", completed, len(config.plan.placements), placement)
                 if result.stopped:
+                    tile_scan_stopped = True
                     break
+            if (
+                not self._stop.is_set()
+                and not tile_scan_stopped
+                and completed == len(config.plan.placements)
+            ):
+                self._finish_at_plan_end(
+                    config.plan,
+                    last_placement=config.plan.placements[-1],
+                    timeout_seconds=config.timeout_seconds,
+                )
         except Exception:
             if not self._stop.is_set():
                 self._write_state(storage, "failed", completed, len(config.plan.placements))
                 raise
-        stopped = self._stop.is_set() or completed < len(config.plan.placements)
+        stopped = (
+            self._stop.is_set()
+            or tile_scan_stopped
+            or completed < len(config.plan.placements)
+        )
         self._write_state(storage, "stopped" if stopped else "completed", completed, len(config.plan.placements))
         return SpatialScanResult(folder, completed, len(config.plan.placements), stopped, False, tuple(results))
+
+    def _finish_at_plan_end(
+        self,
+        plan: TilePlan,
+        *,
+        last_placement: TilePlacement,
+        timeout_seconds: float,
+    ) -> tuple[float, float]:
+        """正常完成后停在用户终点；中止路径不会调用本方法。"""
+        target = plan.end_target
+        last = last_placement.target
+        if abs(last.x_mm - target.x_mm) <= 1e-12 and abs(last.y_mm - target.y_mm) <= 1e-12:
+            return last.as_tuple()
+        self._raise_if_stopped()
+        actual = self.stage.move_absolute_blocking(
+            target.x_mm,
+            target.y_mm,
+            timeout_seconds=timeout_seconds,
+            cancel_event=self._stop,
+        )
+        self.message(
+            f"扫描完成，视野中心已停在绝对 DPOS "
+            f"X={actual[0]:.6g} mm，Y={actual[1]:.6g} mm"
+        )
+        return actual
 
     @staticmethod
     def _write_state(storage: SpatialJobStorage, state: str, completed: int, total: int) -> None:

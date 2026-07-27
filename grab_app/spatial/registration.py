@@ -23,6 +23,47 @@ class RegistrationResult:
         return self.dx_px, self.dy_px
 
 
+def expected_adjacent_translation(
+    frame_shape: tuple[int, int], direction: str, overlap: float
+) -> tuple[float, float]:
+    """返回给定实际重叠率下，相邻瓦片原点的像素位移先验。"""
+    if direction not in {"right", "left", "down", "up"}:
+        raise ValueError("direction 必须是 right、left、down 或 up")
+    if not 0.0 < overlap < 1.0:
+        raise ValueError("overlap 必须位于 (0, 1) 范围")
+    height, width = (int(frame_shape[0]), int(frame_shape[1]))
+    if height <= 0 or width <= 0:
+        raise ValueError("frame_shape 必须为正的 (height, width)")
+    if direction in {"right", "left"}:
+        distance = float(width - max(2, int(round(width * overlap))))
+        return (distance if direction == "right" else -distance), 0.0
+    distance = float(height - max(2, int(round(height * overlap))))
+    return 0.0, (distance if direction == "down" else -distance)
+
+
+def bounded_registration_correction(
+    result: RegistrationResult,
+    *,
+    frame_shape: tuple[int, int],
+    direction: str,
+    overlap: float,
+    max_correction_px: float,
+) -> tuple[float, float] | None:
+    """提取相对 DPOS 先验的小范围残差；拒绝周期纹理造成的大跳变。"""
+    if not result.success:
+        return None
+    limit = float(max_correction_px)
+    if not np.isfinite(limit) or limit < 0:
+        raise ValueError("max_correction_px 必须是非负有限数")
+    expected_x, expected_y = expected_adjacent_translation(
+        frame_shape, direction, overlap
+    )
+    correction = result.dx_px - expected_x, result.dy_px - expected_y
+    if not all(np.isfinite(value) and abs(value) <= limit for value in correction):
+        return None
+    return float(correction[0]), float(correction[1])
+
+
 def _gray_float(image: np.ndarray) -> np.ndarray:
     if image.ndim == 3:
         if image.shape[2] == 3:

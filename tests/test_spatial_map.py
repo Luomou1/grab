@@ -6,6 +6,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
@@ -35,6 +36,17 @@ def test_physical_bounds_convert_map_roi_to_sample_coordinates() -> None:
     assert sample_rect == pytest.approx((0.0, 25.0, 20.0, 10.0))
 
 
+def test_physical_bounds_display_positive_sample_y_upward() -> None:
+    model = SpatialMapModel(200, 100)
+    model.set_map_physical_bounds(-10.0, 20.0, 30.0, 40.0)
+
+    lower_left = model.map_sample_point_to_pixel(-10.0, 20.0)
+    upper_right = model.map_sample_point_to_pixel(30.0, 40.0)
+
+    assert (lower_left.x(), lower_left.y()) == pytest.approx((0.0, 100.0))
+    assert (upper_right.x(), upper_right.y()) == pytest.approx((200.0, 0.0))
+
+
 def test_affine_transform_converts_rotated_map_roi_to_axis_aligned_sample_rect() -> None:
     model = SpatialMapModel(100, 100)
     model.set_world_to_map_transform((0.0, 2.0, -2.0, 0.0, 100.0, 0.0))
@@ -62,6 +74,34 @@ def test_widget_state_updates_are_device_independent(app: QApplication) -> None:
     assert [(point.x(), point.y()) for point in widget.model.route] == [(5.0, 6.0), (20.0, 30.0)]
     assert widget.model.current_scan_point is not None
     assert (widget.model.current_scan_point.x(), widget.model.current_scan_point.y()) == (20.0, 30.0)
+
+
+def test_complete_tile_is_outline_only_and_tile_borders_can_be_hidden(
+    app: QApplication,
+) -> None:
+    widget = SpatialMapWidget()
+    widget.resize(120, 100)
+    widget.set_map_size(100, 80)
+    widget.set_tile_states([SpatialTile("0", QRect(20, 20, 60, 40), "complete")])
+    widget.show()
+    app.processEvents()
+
+    visible = QImage(widget.size(), QImage.Format_ARGB32)
+    widget.render(visible)
+    view = widget._map_view_rect()
+    center_x = round(view.center().x())
+    center_y = round(view.center().y())
+    border_y = round(view.top() + 20 * view.height() / 80)
+
+    assert visible.pixelColor(center_x, center_y) == QColor("#252a33")
+    assert visible.pixelColor(center_x, border_y).green() > 100
+
+    widget.set_tile_borders_visible(False)
+    hidden = QImage(widget.size(), QImage.Format_ARGB32)
+    widget.render(hidden)
+
+    assert not widget.tile_borders_visible
+    assert hidden.pixelColor(center_x, border_y) == QColor("#252a33")
 
 
 def test_mouse_drag_emits_map_pixel_roi_at_boundaries(app: QApplication) -> None:

@@ -116,12 +116,21 @@ class SpatialMapModel:
             0.0,
             0.0,
             0.0,
-            scale_y,
+            -scale_y,
             0.0,
             -min_x * scale_x,
-            -min_y * scale_y,
+            max_y * scale_y,
             1.0,
         )
+
+    def map_sample_point_to_pixel(self, x: float, y: float) -> QPointF:
+        """样品绝对 DPOS 转地图像素；显示采用 X 向右、Y 向上的笛卡尔方向。"""
+        if self._world_to_map is None:
+            raise RuntimeError("尚未设置地图坐标变换")
+        x, y = float(x), float(y)
+        if not isfinite(x) or not isfinite(y):
+            raise ValueError("样品坐标必须是有限数值")
+        return self._world_to_map.map(QPointF(x, y))
 
     def clamp_pixel_rect(self, rect: QRect | Sequence[int]) -> QRect:
         if not isinstance(rect, QRect):
@@ -180,17 +189,18 @@ class SpatialMapWidget(QWidget):
     selection_cancelled = Signal()
     state_changed = Signal()
 
-    _TILE_COLORS = {
-        "pending": QColor(130, 138, 152, 36),
-        "scanning": QColor(255, 184, 77, 104),
-        "complete": QColor(67, 196, 126, 78),
-        "error": QColor(231, 92, 92, 112),
+    _TILE_BORDER_COLORS = {
+        "pending": QColor(130, 138, 152, 120),
+        "scanning": QColor(255, 184, 77, 230),
+        "complete": QColor(67, 196, 126, 230),
+        "error": QColor(231, 92, 92, 230),
     }
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.model = SpatialMapModel()
         self._map_pixmap: QPixmap | None = None
+        self._tile_borders_visible = True
         self._selection_enabled = False
         self._drag_start: QPointF | None = None
         self._drag_current: QPointF | None = None
@@ -200,6 +210,18 @@ class SpatialMapWidget(QWidget):
     @property
     def selected_roi(self) -> QRect | None:
         return QRect(self.model.selected_roi) if self.model.selected_roi is not None else None
+
+    @property
+    def tile_borders_visible(self) -> bool:
+        return self._tile_borders_visible
+
+    def set_tile_borders_visible(self, visible: bool) -> None:
+        visible = bool(visible)
+        if visible == self._tile_borders_visible:
+            return
+        self._tile_borders_visible = visible
+        self.state_changed.emit()
+        self.update()
 
     def set_map_size(self, width: int, height: int) -> None:
         self.model.set_map_size(width, height)
@@ -283,6 +305,9 @@ class SpatialMapWidget(QWidget):
         self, rect: QRect | QRectF | Sequence[float]
     ) -> tuple[float, float, float, float]:
         return self.model.map_pixel_rect_to_sample(rect)
+
+    def map_sample_point_to_pixel(self, x: float, y: float) -> QPointF:
+        return self.model.map_sample_point_to_pixel(x, y)
 
     def set_selected_roi(self, rect: QRect | Sequence[int] | None) -> None:
         self.model.selected_roi = None if rect is None else self.model.clamp_pixel_rect(rect)
@@ -431,12 +456,16 @@ class SpatialMapWidget(QWidget):
         if self._map_pixmap is not None:
             painter.drawPixmap(view, self._map_pixmap, QRectF(self._map_pixmap.rect()))
 
-        for tile in self.model.tiles.values():
-            draw_rect = self._map_rect_to_widget(tile.rect)
-            color = self._TILE_COLORS.get(tile.status, QColor(84, 154, 223, 70))
-            painter.fillRect(draw_rect, color)
-            painter.setPen(QPen(color.lighter(150), 1.0))
-            painter.drawRect(draw_rect)
+        if self._tile_borders_visible:
+            for tile in self.model.tiles.values():
+                draw_rect = self._map_rect_to_widget(tile.rect)
+                color = self._TILE_BORDER_COLORS.get(
+                    tile.status, QColor(84, 154, 223, 180)
+                )
+                width = 2.0 if tile.status in {"scanning", "error"} else 1.25
+                painter.setPen(QPen(color, width))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(draw_rect)
 
         if len(self.model.route) >= 2:
             path = QPainterPath(self._map_to_widget(self.model.route[0]))
