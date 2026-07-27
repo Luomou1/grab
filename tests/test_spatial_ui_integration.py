@@ -36,7 +36,7 @@ def _import_main_window_without_update_file():
     return importlib.import_module("grab_app.ui.main_window").MainWindow
 
 
-def test_main_window_builds_spatial_map_and_plans_tiles() -> None:
+def test_main_window_builds_spatial_map_dialog_and_plans_tiles() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance() or QApplication([])
     MainWindow = _import_main_window_without_update_file()
@@ -49,12 +49,26 @@ def test_main_window_builds_spatial_map_and_plans_tiles() -> None:
         window._survey_plan = plan
         window._prepare_spatial_map(plan)
 
-        assert window.viewer_tabs.count() == 2
+        assert not hasattr(window, "viewer_tabs")
+        assert window.spatial_map.window() is window.spatial_map_dialog
+        assert not window.spatial_map_dialog.isVisible()
+        window._show_spatial_map_dialog()
+        app.processEvents()
+        assert window.spatial_map_dialog.isVisible()
         assert plan.tile_count >= 4
         assert window.spatial_map.model.map_size.width() > 0
         assert len(window.spatial_map.model.tiles) == plan.tile_count
         assert window.spatial_pixel_um.value() == 0.48
         assert window.spatial_pixel_um.text() == "0.48"
+        assert window.spatial_overlap.minimum() == 5
+        assert window.spatial_overlap.maximum() == 10
+        assert window.spatial_overlap.value() == 10
+        assert window.btn_measure_spatial.text() == "测距"
+        assert window.spatial_measurement_status.text() == "测距: 未测量"
+        window._on_spatial_measurement_completed(0.003, -0.004, 0.005)
+        assert window.spatial_measurement_status.text() == (
+            "测距(约): ΔX=3.00 µm  ΔY=-4.00 µm  直线=5.00 µm"
+        )
         assert window.btn_xy_section_title.text() == "XY位移"
         assert window.spatial_pixel_um.window() is window.xy_overview_dialog
         assert not hasattr(window.xy_settings_dialog, "spatial_pixel_um")
@@ -79,6 +93,47 @@ def test_main_window_builds_spatial_map_and_plans_tiles() -> None:
         assert window.spatial_map.tile_borders_visible
         window.show_tile_borders.setChecked(False)
         assert not window.spatial_map.tile_borders_visible
+    finally:
+        window.camera.h_camera = None
+        window.close()
+        app.processEvents()
+
+
+def test_starting_survey_keeps_live_preview_and_opens_map_dialog(
+    tmp_path,
+) -> None:
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    app = QApplication.instance() or QApplication([])
+    MainWindow = _import_main_window_without_update_file()
+    window = MainWindow()
+
+    class FakeWorker:
+        def __init__(self) -> None:
+            self.config = None
+
+        def start_survey(self, config, _done) -> None:
+            self.config = config
+
+        def stop(self) -> None:
+            pass
+
+    worker = FakeWorker()
+    try:
+        window.camera.h_camera = object()
+        window.camera.width = 1280
+        window.camera.height = 1024
+        window.xy_stage = SimpleNamespace(connected=True, close=lambda: None)
+        window.save_path.setText(str(tmp_path))
+        window._new_spatial_worker = lambda: worker
+        window.preview_timer.start()
+
+        window._start_spatial_survey()
+        app.processEvents()
+
+        assert worker.config is not None
+        assert window.preview_timer.isActive()
+        assert window.spatial_map_dialog.isVisible()
+        assert window.spatial_map_dialog.scan_running
     finally:
         window.camera.h_camera = None
         window.close()
@@ -221,7 +276,7 @@ def test_xy_spatial_control_tab_stays_compact_when_dialog_is_tall() -> None:
         app.processEvents()
 
 
-def test_sample_map_draws_higher_absolute_dpos_y_above_lower_y() -> None:
+def test_sample_map_draws_lower_absolute_dpos_y_above_higher_y() -> None:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     app = QApplication.instance() or QApplication([])
     MainWindow = _import_main_window_without_update_file()
@@ -233,8 +288,8 @@ def test_sample_map_draws_higher_absolute_dpos_y_above_lower_y() -> None:
         window.xy_safe_y_min.setValue(-1.0)
         window.survey_x_start.setValue(1.0)
         window.survey_x_end.setValue(2.0)
-        window.survey_y_start.setValue(0.4)
-        window.survey_y_end.setValue(-0.2)
+        window.survey_y_start.setValue(-0.4)
+        window.survey_y_end.setValue(0.2)
         plan = window._plan_spatial_center_scan()
         window._prepare_spatial_map(plan)
 
@@ -245,7 +300,8 @@ def test_sample_map_draws_higher_absolute_dpos_y_above_lower_y() -> None:
             plan, plan.end_target.x_mm, plan.end_target.y_mm
         )
 
-        assert plan.start_target.y_mm > plan.end_target.y_mm
+        assert plan.start_target.y_mm == pytest.approx(-0.4)
+        assert plan.start_target.y_mm < plan.end_target.y_mm
         assert start.y() < end.y()
     finally:
         window.camera.h_camera = None
@@ -360,14 +416,14 @@ def test_live_mosaic_uses_effective_overlap_and_dpos_anchored_correction(
         window.survey_y_start.setValue(0.4018)
         window.survey_y_end.setValue(-0.2782)
         plan = window._plan_spatial_center_scan()
-        assert (plan.rows, plan.columns) == (3, 6)
+        assert (plan.rows, plan.columns) == (3, 5)
         window._survey_plan = plan
         window._prepare_spatial_map(plan)
         composer = CaptureComposer(window._spatial_map_shape)
         window._spatial_composer = composer
         monkeypatch.setattr(module, "estimate_adjacent_translation", fake_registration)
         assert window.spatial_effective_overlap.text() == (
-            "有效重叠: X=34.90%  Y=30.83%"
+            "有效重叠: X=10.00%  Y=10.00%"
         )
         frame = np.arange(80 * 100, dtype=np.uint8).reshape(80, 100)
         sample = SimpleNamespace(frame=frame)

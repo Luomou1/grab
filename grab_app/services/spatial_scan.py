@@ -29,6 +29,8 @@ class SpatialStage(Protocol):
         cancel_event: threading.Event | None = None,
     ) -> tuple[float, float]: ...
 
+    def refresh_status(self) -> object: ...
+
     def stop_all(self) -> None: ...
 
 
@@ -155,7 +157,7 @@ class SpatialScanWorker:
         try:
             for index, placement in enumerate(config.plan.placements, start=1):
                 self._raise_if_stopped()
-                actual = self.stage.move_absolute_blocking(
+                self.stage.move_absolute_blocking(
                     placement.target.x_mm,
                     placement.target.y_mm,
                     timeout_seconds=config.timeout_seconds,
@@ -163,9 +165,17 @@ class SpatialScanWorker:
                 )
                 self._wait_settle(config.settle_ms)
                 self._raise_if_stopped()
-                sample = self.camera.soft_trigger_and_grab_sample(2000)
+                capture_barrier = self.camera.capture_barrier()
+                sample = self.camera.wait_for_fresh_sample(
+                    capture_barrier,
+                    discard_frames=1,
+                    timeout_ms=2000,
+                )
                 if sample is None:
-                    raise RuntimeError(f"概览瓦片 {index} 获取图像失败")
+                    raise RuntimeError(
+                        f"概览瓦片 {index} 未能取得到位后的第二张连续新帧"
+                    )
+                actual = self._refresh_stage_position()
                 tile_path = folder / "survey" / "tiles" / f"tile_r{placement.row:04d}_c{placement.column:04d}.{config.extension}"
                 tile_path.parent.mkdir(parents=True, exist_ok=True)
                 self.scanner.save_frame(tile_path, sample.frame, config.bit_depth)
@@ -178,8 +188,13 @@ class SpatialScanWorker:
                         "target_y_mm": placement.target.y_mm,
                         "actual_x_mm": actual[0],
                         "actual_y_mm": actual[1],
+                        "capture_barrier_count": capture_barrier,
+                        "discarded_frames": 1,
                         "capture_count": sample.capture_count,
                         "captured_at": sample.captured_at,
+                        "frame_age_ms": max(0.0, (time.time() - sample.captured_at) * 1000.0),
+                        "is_trigger_frame": sample.is_trigger_frame,
+                        "sdk_timestamp_01ms": sample.sdk_timestamp_01ms,
                         "path": str(tile_path.relative_to(folder)),
                         "status": "completed",
                     }
@@ -188,11 +203,6 @@ class SpatialScanWorker:
                 completed = index
                 self._write_state(storage, "running", completed, len(config.plan.placements))
                 self.progress("概览扫描", completed, len(config.plan.placements), placement)
-            self._finish_at_plan_end(
-                config.plan,
-                last_placement=config.plan.placements[-1],
-                timeout_seconds=config.timeout_seconds,
-            )
             self._write_state(storage, "completed", completed, len(config.plan.placements))
             self._save_preview(storage)
             return SpatialScanResult(folder, completed, len(config.plan.placements), False, True)
@@ -229,7 +239,13 @@ class SpatialScanWorker:
                 self._raise_if_stopped()
                 tile_dir = folder / "acquisition" / f"tile_r{placement.row:04d}_c{placement.column:04d}"
                 tile_dir.mkdir(parents=True, exist_ok=True)
-                tile_config = replace(config.pzt_config, save_dir=tile_dir)
+                # XY 区域内的逐瓦片纵向扫描固定使用软触发；普通保存扫描的
+                # 用户选择由其自身入口处理，不能串入这里。
+                tile_config = replace(
+                    config.pzt_config,
+                    save_dir=tile_dir,
+                    trigger_mode="soft",
+                )
                 result = self.scanner.run_sync(tile_config)
                 results.append(result)
                 completed = index
@@ -250,16 +266,6 @@ class SpatialScanWorker:
                 if result.stopped:
                     tile_scan_stopped = True
                     break
-            if (
-                not self._stop.is_set()
-                and not tile_scan_stopped
-                and completed == len(config.plan.placements)
-            ):
-                self._finish_at_plan_end(
-                    config.plan,
-                    last_placement=config.plan.placements[-1],
-                    timeout_seconds=config.timeout_seconds,
-                )
         except Exception:
             if not self._stop.is_set():
                 self._write_state(storage, "failed", completed, len(config.plan.placements))
@@ -271,31 +277,6 @@ class SpatialScanWorker:
         )
         self._write_state(storage, "stopped" if stopped else "completed", completed, len(config.plan.placements))
         return SpatialScanResult(folder, completed, len(config.plan.placements), stopped, False, tuple(results))
-
-    def _finish_at_plan_end(
-        self,
-        plan: TilePlan,
-        *,
-        last_placement: TilePlacement,
-        timeout_seconds: float,
-    ) -> tuple[float, float]:
-        """正常完成后停在用户终点；中止路径不会调用本方法。"""
-        target = plan.end_target
-        last = last_placement.target
-        if abs(last.x_mm - target.x_mm) <= 1e-12 and abs(last.y_mm - target.y_mm) <= 1e-12:
-            return last.as_tuple()
-        self._raise_if_stopped()
-        actual = self.stage.move_absolute_blocking(
-            target.x_mm,
-            target.y_mm,
-            timeout_seconds=timeout_seconds,
-            cancel_event=self._stop,
-        )
-        self.message(
-            f"扫描完成，视野中心已停在绝对 DPOS "
-            f"X={actual[0]:.6g} mm，Y={actual[1]:.6g} mm"
-        )
-        return actual
 
     @staticmethod
     def _write_state(storage: SpatialJobStorage, state: str, completed: int, total: int) -> None:
@@ -325,7 +306,8 @@ class SpatialScanWorker:
         else:
             raise ValueError(f"不支持的位深: {bit_depth}")
         self.camera.apply_quantitative_profile()
-        self.camera.set_trigger_mode(1)
+        # 样品地图概览独占连续采集策略，主界面预览可在扫描期间继续刷新。
+        self.camera.set_trigger_mode(0)
 
     def _restore_camera(self) -> None:
         try:
@@ -339,6 +321,14 @@ class SpatialScanWorker:
         while time.perf_counter() < deadline:
             self._raise_if_stopped()
             time.sleep(min(0.02, max(0.0, deadline - time.perf_counter())))
+
+    def _refresh_stage_position(self) -> tuple[float, float]:
+        """在抓拍完成后重新读取 DPOS，作为该帧唯一的位置记录。"""
+        snapshot = self.stage.refresh_status()
+        axes = getattr(snapshot, "axes", None)
+        if axes is None or 0 not in axes or 1 not in axes:
+            raise RuntimeError("抓拍后无法读取 XY 位移台 DPOS")
+        return float(axes[0].dpos), float(axes[1].dpos)
 
     def _raise_if_stopped(self) -> None:
         if self._stop.is_set():

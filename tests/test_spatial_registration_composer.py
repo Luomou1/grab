@@ -21,6 +21,39 @@ def test_phase_correlation_uses_expected_horizontal_overlap() -> None:
     assert result.confidence > 0.5
 
 
+@pytest.mark.parametrize(
+    ("direction", "reference_origin", "moving_origin", "expected_translation"),
+    [
+        ("right", (80, 100), (158, 100), (78.0, 0.0)),
+        ("left", (180, 100), (102, 100), (-78.0, 0.0)),
+        ("down", (100, 80), (100, 158), (0.0, 78.0)),
+        ("up", (100, 180), (100, 102), (0.0, -78.0)),
+    ],
+)
+def test_phase_correlation_applies_nonzero_residual_in_the_correct_direction(
+    direction: str,
+    reference_origin: tuple[int, int],
+    moving_origin: tuple[int, int],
+    expected_translation: tuple[float, float],
+) -> None:
+    rng = np.random.default_rng(19)
+    scene = rng.normal(128, 25, size=(360, 360)).astype(np.float32)
+    ref_x, ref_y = reference_origin
+    mov_x, mov_y = moving_origin
+    reference = scene[ref_y:ref_y + 100, ref_x:ref_x + 100]
+    moving = scene[mov_y:mov_y + 100, mov_x:mov_x + 100]
+
+    result = estimate_adjacent_translation(
+        reference,
+        moving,
+        direction=direction,
+        overlap=0.2,
+    )
+
+    assert result.success
+    assert result.translation_px == pytest.approx(expected_translation, abs=0.2)
+
+
 def test_phase_correlation_safely_falls_back_for_blank_tiles() -> None:
     blank = np.zeros((50, 100), dtype=np.uint8)
     result = estimate_adjacent_translation(blank, blank, direction="right", overlap=0.25)

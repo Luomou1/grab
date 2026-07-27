@@ -5,12 +5,17 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QPoint, QRect, Qt
+from PySide6.QtCore import QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QColor, QImage
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from grab_app.ui.spatial_map import SpatialMapModel, SpatialMapWidget, SpatialTile
+from grab_app.ui.spatial_map import (
+    SpatialMapDialog,
+    SpatialMapModel,
+    SpatialMapWidget,
+    SpatialTile,
+)
 
 
 @pytest.fixture(scope="module")
@@ -36,15 +41,24 @@ def test_physical_bounds_convert_map_roi_to_sample_coordinates() -> None:
     assert sample_rect == pytest.approx((0.0, 25.0, 20.0, 10.0))
 
 
-def test_physical_bounds_display_positive_sample_y_upward() -> None:
+def test_physical_bounds_display_increasing_sample_y_downward() -> None:
     model = SpatialMapModel(200, 100)
     model.set_map_physical_bounds(-10.0, 20.0, 30.0, 40.0)
 
     lower_left = model.map_sample_point_to_pixel(-10.0, 20.0)
     upper_right = model.map_sample_point_to_pixel(30.0, 40.0)
 
-    assert (lower_left.x(), lower_left.y()) == pytest.approx((0.0, 100.0))
-    assert (upper_right.x(), upper_right.y()) == pytest.approx((200.0, 0.0))
+    assert (lower_left.x(), lower_left.y()) == pytest.approx((0.0, 0.0))
+    assert (upper_right.x(), upper_right.y()) == pytest.approx((200.0, 100.0))
+
+
+def test_map_pixel_point_converts_to_sample_coordinates() -> None:
+    model = SpatialMapModel(200, 100)
+    model.set_map_physical_bounds(-10.0, 20.0, 30.0, 40.0)
+
+    sample_point = model.map_pixel_point_to_sample(QPointF(50.0, 25.0))
+
+    assert sample_point == pytest.approx((0.0, 25.0))
 
 
 def test_affine_transform_converts_rotated_map_roi_to_axis_aligned_sample_rect() -> None:
@@ -135,3 +149,48 @@ def test_cancel_selection_clears_roi_and_emits_signal(app: QApplication) -> None
 
     assert widget.selected_roi is None
     assert emissions == [True]
+
+
+def test_two_point_measurement_emits_sample_axis_deltas_and_distance(
+    app: QApplication,
+) -> None:
+    widget = SpatialMapWidget()
+    widget.resize(220, 180)
+    widget.set_map_size(100, 80)
+    widget.set_map_physical_bounds(0.0, 0.0, 10.0, 8.0)
+    widget.set_measurement_enabled(True)
+    widget.show()
+    app.processEvents()
+    emissions: list[tuple[float, float, float]] = []
+    widget.measurement_completed.connect(
+        lambda dx, dy, distance: emissions.append((dx, dy, distance))
+    )
+
+    start = widget._map_to_widget(QPointF(10.0, 20.0)).toPoint()
+    end = widget._map_to_widget(QPointF(70.0, 60.0)).toPoint()
+    QTest.mouseClick(widget, Qt.LeftButton, pos=start)
+    QTest.mouseClick(widget, Qt.LeftButton, pos=end)
+
+    assert len(emissions) == 1
+    dx, dy, distance = emissions[0]
+    assert (dx, dy) == pytest.approx((6.0, 4.0), abs=0.05)
+    assert distance == pytest.approx((6.0**2 + 4.0**2) ** 0.5, abs=0.05)
+
+
+def test_running_map_dialog_requests_stop_before_close(
+    app: QApplication, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dialog = SpatialMapDialog()
+    dialog.set_scan_running(True)
+    requested: list[bool] = []
+    dialog.stop_requested.connect(lambda: requested.append(True))
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    dialog.show()
+    app.processEvents()
+
+    dialog.close()
+    app.processEvents()
+
+    assert requested == [True]
+    assert not dialog.scan_running
+    assert not dialog.isVisible()

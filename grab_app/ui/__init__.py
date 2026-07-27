@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .spatial_map import SpatialMapModel, SpatialMapWidget, SpatialTile
+from .spatial_map import SpatialMapDialog, SpatialMapModel, SpatialMapWidget, SpatialTile
 
 if TYPE_CHECKING:
     from .main_window import MainWindow
@@ -17,4 +17,10 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-__all__ = ["MainWindow", "SpatialMapModel", "SpatialMapWidget", "SpatialTile"]
+__all__ = [
+    "MainWindow",
+    "SpatialMapDialog",
+    "SpatialMapModel",
+    "SpatialMapWidget",
+    "SpatialTile",
+]

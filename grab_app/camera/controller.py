@@ -269,6 +269,52 @@ class CameraController:
                 frame_contrast=info.frame_contrast,
             )
 
+    def capture_barrier(self) -> int:
+        """返回当前连续采集帧号，用作位移稳定后的新帧屏障。"""
+        with self._frame_lock:
+            return int(self.capture_count)
+
+    def wait_for_fresh_sample(
+        self,
+        after_capture_count: int,
+        *,
+        discard_frames: int = 1,
+        timeout_ms: int = 2000,
+    ) -> CameraFrame | None:
+        """等待屏障后的新连续帧，并丢弃可能仍在流水线中的首批帧。
+
+        相机在连续模式下可能已有一张于位移稳定前开始曝光、但在稳定后才送达
+        的在途帧。概览采集默认丢弃第一张新帧，至少接收第二张，避免把旧位置
+        的图像绑定到新的 DPOS。
+        """
+        after_capture_count = int(after_capture_count)
+        discard_frames = int(discard_frames)
+        if after_capture_count < 0:
+            raise ValueError("after_capture_count 不能为负数")
+        if discard_frames < 0:
+            raise ValueError("discard_frames 不能为负数")
+        target_count = after_capture_count + discard_frames + 1
+        deadline = time.perf_counter() + max(int(timeout_ms), 1) / 1000.0
+        while time.perf_counter() < deadline:
+            with self._frame_lock:
+                info = self._latest_info
+                if info is not None and info.capture_count >= target_count:
+                    return CameraFrame(
+                        frame=info.frame.copy(),
+                        capture_count=info.capture_count,
+                        captured_at=info.captured_at,
+                        exposure_us=self._safe_get_exposure(),
+                        gain_x=self._safe_get_gain_x(),
+                        is_trigger_frame=info.is_trigger_frame,
+                        sdk_timestamp_01ms=info.sdk_timestamp_01ms,
+                        frame_exposure_us=info.frame_exposure_us,
+                        frame_gain_x=info.frame_gain_x,
+                        frame_gamma=info.frame_gamma,
+                        frame_contrast=info.frame_contrast,
+                    )
+            time.sleep(0.001)
+        return None
+
     def soft_trigger_and_grab(self, timeout_ms: int = 2000) -> np.ndarray | None:
         sample = self.soft_trigger_and_grab_sample(timeout_ms)
         return None if sample is None else sample.frame
@@ -278,11 +324,20 @@ class CameraController:
             start_count = self.capture_count
         triggered_at = time.time()
         with self._control_lock:
+            clear_buffer = getattr(self._mvsdk, "CameraClearBuffer", None)
+            if callable(clear_buffer):
+                error_code = clear_buffer(self.h_camera)
+                if error_code not in (None, 0):
+                    raise CameraError(f"清理相机缓存失败，SDK 错误码: {error_code}")
             self._mvsdk.CameraSoftTrigger(self.h_camera)
         deadline = time.perf_counter() + max(timeout_ms, 1) / 1000.0
         while time.perf_counter() < deadline:
             with self._frame_lock:
-                if self._latest_info is not None and self._latest_info.capture_count > start_count:
+                if (
+                    self._latest_info is not None
+                    and self._latest_info.capture_count > start_count
+                    and self._latest_info.is_trigger_frame is True
+                ):
                     info = self._latest_info
                     return CameraFrame(
                         frame=info.frame.copy(),

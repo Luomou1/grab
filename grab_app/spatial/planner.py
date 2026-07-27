@@ -31,8 +31,9 @@ def _axis_centers(start: float, end: float, footprint: float, overlap: float) ->
     max_step = footprint * (1.0 - overlap)
     count = max(2, int(math.ceil((length - footprint) / max_step)) + 1)
     first = start + footprint / 2.0
-    last = end - footprint / 2.0
-    return np.linspace(first, last, count).tolist()
+    # 固定步距保证实际重叠率不会因均分取整而增大；末端允许适量越过 ROI，
+    # 从而在不漏扫的前提下维持用户设置的低重叠率。
+    return [first + index * max_step for index in range(count)]
 
 
 def _scan_centers(start: float, end: float, coverage: float, overlap: float) -> list[float]:
@@ -50,7 +51,8 @@ def _scan_centers(start: float, end: float, coverage: float, overlap: float) -> 
     if max_step <= 0 or not math.isfinite(max_step):
         raise ValueError("扫描中心间距无效，请检查标定和重叠率")
     count = max(2, int(math.ceil(abs(end - start) / max_step)) + 1)
-    return np.linspace(start, end, count).tolist()
+    direction = 1.0 if end > start else -1.0
+    return [float(start + direction * index * max_step) for index in range(count)]
 
 
 def frame_footprint_mm(
@@ -112,14 +114,14 @@ def plan_tiles(
     roi: SpatialRect,
     frame_size_px: tuple[int, int],
     calibration: SpatialCalibration,
-    overlap: float = 0.2,
+    overlap: float = 0.1,
     *,
     route: str = "serpentine",
     safety_limits: SafetyLimits | SpatialRect | None,
 ) -> TilePlan:
     """生成完整覆盖 ROI 的最小规则网格，并严格校验整个帧视场。"""
-    if not 0.1 <= overlap <= 0.4:
-        raise ValueError("overlap 必须位于 [0.1, 0.4] 范围")
+    if not 0.05 <= overlap <= 0.1:
+        raise ValueError("overlap 必须位于 [0.05, 0.1] 范围")
     if route not in {"serpentine", "unidirectional"}:
         raise ValueError("route 仅支持 serpentine 或 unidirectional")
     if safety_limits is None:
@@ -175,14 +177,14 @@ def plan_center_scan(
     y_end_mm: float,
     frame_size_px: tuple[int, int],
     calibration: SpatialCalibration,
-    overlap: float = 0.2,
+    overlap: float = 0.1,
     *,
     route: str = "serpentine",
     safety_limits: SafetyLimits | SpatialRect | None,
 ) -> TilePlan:
     """按绝对 DPOS 视野中心规划概览，支持单行、单列和负坐标。"""
-    if not 0.1 <= overlap <= 0.4:
-        raise ValueError("overlap 必须位于 [0.1, 0.4] 范围")
+    if not 0.05 <= overlap <= 0.1:
+        raise ValueError("overlap 必须位于 [0.05, 0.1] 范围")
     if route not in {"serpentine", "unidirectional"}:
         raise ValueError("route 仅支持 serpentine 或 unidirectional")
     if safety_limits is None:

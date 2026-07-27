@@ -132,8 +132,10 @@ def estimate_adjacent_translation(
     confidence = float(response)
     if not all(np.isfinite(v) for v in (residual_x, residual_y, confidence)) or confidence < min_confidence:
         return RegistrationResult(*fallback, max(0.0, confidence) if np.isfinite(confidence) else 0.0, False, True)
+    # phaseCorrelate(ref_roi, mov_roi) 返回 mov_roi 相对 ref_roi 的图像内容位移；
+    # 瓦片原点的实际残差方向与之相反，因此必须从 DPOS/重叠率先验中减去。
     return RegistrationResult(
-        fallback[0] + float(residual_x), fallback[1] + float(residual_y),
+        fallback[0] - float(residual_x), fallback[1] - float(residual_y),
         confidence, True, False,
     )
 

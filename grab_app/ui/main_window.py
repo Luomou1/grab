@@ -78,7 +78,7 @@ from grab_app.spatial import (
     plan_center_scan,
     plan_tiles,
 )
-from grab_app.ui.spatial_map import SpatialMapWidget, SpatialTile
+from grab_app.ui.spatial_map import SpatialMapDialog, SpatialTile
 from grab_app.ui.xy_stage_dialog import XYStageControlDialog
 from grab_app.xy_stage import XYStageExecutor
 from grab_app.update import UpdateInfo, check_latest_release, download_installer, start_installer
@@ -795,17 +795,11 @@ class MainWindow(QMainWindow):
         viewer_layout.setContentsMargins(12, 12, 12, 10)
         viewer_layout.setSpacing(8)
 
-        self.viewer_tabs = QTabWidget()
-        self.viewer_tabs.setObjectName("viewerTabs")
-        camera_page = QWidget()
-        camera_layout = QVBoxLayout(camera_page)
-        camera_layout.setContentsMargins(0, 0, 0, 0)
-        camera_layout.addWidget(self.preview)
-        self.spatial_map = SpatialMapWidget()
+        self.spatial_map_dialog = SpatialMapDialog(self)
+        self.spatial_map = self.spatial_map_dialog.map_widget
         self.spatial_map.roi_sample_selected.connect(self._spatial_roi_selected)
-        self.viewer_tabs.addTab(camera_page, "相机预览")
-        self.viewer_tabs.addTab(self.spatial_map, "样品地图")
-        viewer_layout.addWidget(self.viewer_tabs, 1)
+        self.spatial_map_dialog.stop_requested.connect(self._stop_spatial_scan)
+        viewer_layout.addWidget(self.preview, 1)
 
         self.progress = QProgressBar()
         self.progress.setObjectName("scanProgress")
@@ -1128,7 +1122,7 @@ class MainWindow(QMainWindow):
         layout.setVerticalSpacing(10)
 
         self.spatial_pixel_um = self._dspin(0.01, 10.0, 0.48, 6, 0.01)
-        self.spatial_overlap = self._ispin(10, 40, 20)
+        self.spatial_overlap = self._ispin(5, 10, 10)
         self.spatial_overlap.setSuffix(" %")
         self.spatial_settle = self._ispin(0, 5000, 200)
         self.spatial_settle.setSuffix(" ms")
@@ -1194,6 +1188,8 @@ class MainWindow(QMainWindow):
             widget.setToolTip(dpos_hint)
         self.spatial_roi_status = QLabel("空间 ROI: 未选择")
         self.spatial_roi_status.setWordWrap(True)
+        self.spatial_measurement_status = QLabel("测距: 未测量")
+        self.spatial_measurement_status.setWordWrap(True)
         self.spatial_effective_overlap = QLabel("有效重叠: 规划后显示")
         self.spatial_effective_overlap.setToolTip(
             "根据扫描跨度、整数行列数和相机视场计算；X、Y 可能不同。"
@@ -1204,13 +1200,19 @@ class MainWindow(QMainWindow):
         self.show_tile_borders.setToolTip("显示或隐藏样品地图上的瓦片状态边框")
         self.btn_start_survey = QPushButton("概览扫描")
         self.btn_select_spatial_roi = QPushButton("框选区域")
+        self.btn_measure_spatial = QPushButton("测距")
+        self.btn_measure_spatial.setCheckable(True)
         self.btn_plan_spatial = QPushButton("规划")
         self.btn_start_spatial = QPushButton("执行纵向扫描")
         self.btn_stop_spatial = QPushButton("停止")
         self.btn_start_survey.setObjectName("primaryButton")
         self.btn_start_spatial.setObjectName("primaryButton")
         self.btn_stop_spatial.setObjectName("dangerButton")
-        for button in (self.btn_select_spatial_roi, self.btn_plan_spatial):
+        for button in (
+            self.btn_select_spatial_roi,
+            self.btn_measure_spatial,
+            self.btn_plan_spatial,
+        ):
             button.setObjectName("secondaryButton")
         self.btn_stop_spatial.setEnabled(False)
 
@@ -1231,14 +1233,17 @@ class MainWindow(QMainWindow):
         map_display_row.addStretch(1)
         map_display_row.addWidget(self.show_tile_borders)
         layout.addLayout(map_display_row, 4, 0, 1, 4)
-        layout.addWidget(self.btn_start_survey, 5, 0, 1, 2)
-        layout.addWidget(self.btn_select_spatial_roi, 5, 2, 1, 2)
-        layout.addWidget(self.btn_plan_spatial, 6, 0)
-        layout.addWidget(self.btn_start_spatial, 6, 1, 1, 2)
-        layout.addWidget(self.btn_stop_spatial, 6, 3)
+        layout.addWidget(self.spatial_measurement_status, 5, 0, 1, 4)
+        layout.addWidget(self.btn_start_survey, 6, 0, 1, 2)
+        layout.addWidget(self.btn_select_spatial_roi, 6, 2)
+        layout.addWidget(self.btn_measure_spatial, 6, 3)
+        layout.addWidget(self.btn_plan_spatial, 7, 0)
+        layout.addWidget(self.btn_start_spatial, 7, 1, 1, 2)
+        layout.addWidget(self.btn_stop_spatial, 7, 3)
 
         self.btn_start_survey.clicked.connect(self._start_spatial_survey)
         self.btn_select_spatial_roi.clicked.connect(self._activate_spatial_selection)
+        self.btn_measure_spatial.toggled.connect(self._toggle_spatial_measurement)
         self.btn_plan_spatial.clicked.connect(self._plan_selected_spatial_roi)
         self.btn_start_spatial.clicked.connect(self._start_spatial_acquisition)
         self.btn_stop_spatial.clicked.connect(self._stop_spatial_scan)
@@ -1250,6 +1255,12 @@ class MainWindow(QMainWindow):
         )
         self.show_tile_borders.toggled.connect(
             self.spatial_map.set_tile_borders_visible
+        )
+        self.spatial_map.measurement_completed.connect(
+            self._on_spatial_measurement_completed
+        )
+        self.spatial_map.measurement_cancelled.connect(
+            lambda: self.spatial_measurement_status.setText("测距: 未测量")
         )
         return box
 
@@ -2519,6 +2530,10 @@ class MainWindow(QMainWindow):
             self._acquisition_plan = None
             self._spatial_roi = None
             self.spatial_roi_status.setText("空间 ROI: 标定已失效")
+            if hasattr(self, "btn_measure_spatial"):
+                self.btn_measure_spatial.setChecked(False)
+                self.spatial_map.clear_measurement()
+                self.spatial_measurement_status.setText("测距: 地图无效")
         if had_camera_calibration or had_spatial_calibration or had_spatial_state:
             self._log(f"校准已失效: {reason}")
 
@@ -2764,21 +2779,44 @@ class MainWindow(QMainWindow):
             self.xy_stage.move_absolute_blocking(x0, y0 + dy, timeout_seconds=30)
             time.sleep(settle_seconds)
             y_sample = self.camera.soft_trigger_and_grab_sample(2000)
+            self.xy_stage.move_absolute_blocking(x0 + dx, y0 + dy, timeout_seconds=30)
+            time.sleep(settle_seconds)
+            xy_sample = self.camera.soft_trigger_and_grab_sample(2000)
             self.xy_stage.move_absolute_blocking(x0, y0, timeout_seconds=30)
-            if x_sample is None or y_sample is None:
+            if x_sample is None or y_sample is None or xy_sample is None:
                 raise RuntimeError("标定图像不足")
             base_f = base.frame.astype(np.float32)
             x_f = x_sample.frame.astype(np.float32)
             y_f = y_sample.frame.astype(np.float32)
+            xy_f = xy_sample.frame.astype(np.float32)
             (x_dx, x_dy), x_response = cv2.phaseCorrelate(base_f, x_f)
             (y_dx, y_dy), y_response = cv2.phaseCorrelate(base_f, y_f)
-            if min(x_response, y_response) < 0.1:
+            (xy_dx, xy_dy), xy_response = cv2.phaseCorrelate(base_f, xy_f)
+            if min(x_response, y_response, xy_response) < 0.1:
                 raise RuntimeError(
-                    f"空间标定相关度过低: X={x_response:.3f}, Y={y_response:.3f}"
+                    "空间标定相关度过低: "
+                    f"X={x_response:.3f}, Y={y_response:.3f}, XY={xy_response:.3f}"
+                )
+            closure_error = float(np.hypot(xy_dx - x_dx - y_dx, xy_dy - x_dy - y_dy))
+            closure_limit = max(10.0, 0.05 * (np.hypot(x_dx, x_dy) + np.hypot(y_dx, y_dy)))
+            if closure_error > closure_limit:
+                raise RuntimeError(
+                    "空间标定闭合误差过大，可能匹配到了周期纹理的错误刻线: "
+                    f"{closure_error:.3f} px > {closure_limit:.3f} px"
                 )
             fit = fit_affine_calibration(
-                [(x0, y0), (x0 + dx, y0), (x0, y0 + dy)],
-                [(0.0, 0.0), (x_dx, x_dy), (y_dx, y_dy)],
+                [
+                    (x0, y0),
+                    (x0 + dx, y0),
+                    (x0, y0 + dy),
+                    (x0 + dx, y0 + dy),
+                ],
+                [
+                    (0.0, 0.0),
+                    (x_dx, x_dy),
+                    (y_dx, y_dy),
+                    (xy_dx, xy_dy),
+                ],
                 fingerprint=fingerprint,
             )
             self.bridge.spatial_calibrated.emit(fit, None)
@@ -2825,6 +2863,9 @@ class MainWindow(QMainWindow):
         self._acquisition_plan = None
         self._spatial_roi = None
         self.spatial_roi_status.setText("空间 ROI: 像素间距已变化，请重新概览")
+        self.btn_measure_spatial.setChecked(False)
+        self.spatial_map.clear_measurement()
+        self.spatial_measurement_status.setText("测距: 地图无效")
         self.spatial_effective_overlap.setText("有效重叠: 重新规划后更新")
         self._update_spatial_center_ranges()
         self._log(f"空间像素间距已设为 {self.spatial_pixel_um.value():.6f} µm/px")
@@ -2899,11 +2940,18 @@ class MainWindow(QMainWindow):
             tile_states.append(SpatialTile(f"{item.row}:{item.column}", rect, "pending"))
         self.spatial_map.set_tile_states(tile_states)
         self.spatial_map.clear_map_image()
+        self.btn_measure_spatial.setChecked(False)
+        self.spatial_map.clear_measurement()
+        self.spatial_measurement_status.setText("测距: 未测量")
         self._spatial_tile_states = {tile.tile_id: tile for tile in tile_states}
         self._spatial_tile_origins.clear()
         self._last_spatial_tile = None
         self._update_spatial_effective_overlap(plan)
-        self.viewer_tabs.setCurrentIndex(1)
+
+    def _show_spatial_map_dialog(self) -> None:
+        self.spatial_map_dialog.show()
+        self.spatial_map_dialog.raise_()
+        self.spatial_map_dialog.activateWindow()
 
     def _update_spatial_effective_overlap(self, plan: TilePlan) -> None:
         overlap_x, overlap_y = plan.effective_overlap_xy
@@ -2942,9 +2990,38 @@ class MainWindow(QMainWindow):
         if self._survey_plan is None:
             self._show_error("框选空间 ROI", RuntimeError("请先完成一次概览扫描"))
             return
-        self.viewer_tabs.setCurrentIndex(1)
+        self.btn_measure_spatial.setChecked(False)
+        self.spatial_map.clear_measurement()
+        self.spatial_measurement_status.setText("测距: 未测量")
+        self._show_spatial_map_dialog()
         self.spatial_map.set_selection_enabled(True)
         self._log("请在样品地图上拖拽框选空间 ROI，按 Esc 或右键取消")
+
+    def _toggle_spatial_measurement(self, enabled: bool) -> None:
+        if enabled and self._survey_plan is None:
+            self.btn_measure_spatial.blockSignals(True)
+            self.btn_measure_spatial.setChecked(False)
+            self.btn_measure_spatial.blockSignals(False)
+            self._show_error("样品地图测距", RuntimeError("请先完成一次概览扫描"))
+            return
+        self.spatial_map.set_measurement_enabled(enabled)
+        if not enabled:
+            return
+        self.spatial_map.set_selection_enabled(False)
+        self.spatial_map.clear_measurement()
+        self.spatial_measurement_status.setText("测距: 请依次点击两个点")
+        self._show_spatial_map_dialog()
+        self._log("样品地图测距已启用，请依次点击两个点；按 Esc 或右键取消")
+
+    def _on_spatial_measurement_completed(
+        self, dx_mm: float, dy_mm: float, distance_mm: float
+    ) -> None:
+        scale, unit = (1000.0, "µm") if distance_mm < 1.0 else (1.0, "mm")
+        self.spatial_measurement_status.setText(
+            f"测距(约): ΔX={dx_mm * scale:.2f} {unit}  "
+            f"ΔY={dy_mm * scale:.2f} {unit}  "
+            f"直线={distance_mm * scale:.2f} {unit}"
+        )
 
     def _spatial_roi_selected(self, x: float, y: float, width: float, height: float) -> None:
         try:
@@ -3021,10 +3098,11 @@ class MainWindow(QMainWindow):
             self._spatial_roi = None
             self.spatial_roi_status.setText("空间 ROI: 未选择")
             self._prepare_spatial_map(plan)
+            self._show_spatial_map_dialog()
             save_dir = Path(self.save_path.text())
             save_dir.mkdir(parents=True, exist_ok=True)
-            if self.preview_timer.isActive():
-                self._stop_preview()
+            if not self.preview_timer.isActive():
+                self._start_preview()
             self.spatial_worker = self._new_spatial_worker()
             self._set_spatial_locked(True)
             self.spatial_worker.start_survey(
@@ -3090,6 +3168,7 @@ class MainWindow(QMainWindow):
 
     def _set_spatial_locked(self, locked: bool) -> None:
         self._set_scan_locked(locked)
+        self.spatial_map_dialog.set_scan_running(locked)
         self.btn_start_survey.setEnabled(not locked)
         self.btn_select_spatial_roi.setEnabled(not locked)
         self.btn_plan_spatial.setEnabled(not locked)
@@ -3513,6 +3592,8 @@ class MainWindow(QMainWindow):
         self.pzt.close()
         self.xy_settings_dialog.close()
         self.xy_overview_dialog.close()
+        self.spatial_map_dialog.set_scan_running(False)
+        self.spatial_map_dialog.close()
         if self.xy_stage is not None:
             self.xy_stage.close()
             self.xy_stage = None

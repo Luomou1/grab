@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
+from math import hypot, isfinite
 from typing import Iterable, Mapping, Sequence
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import (
     QColor,
+    QCloseEvent,
     QImage,
     QKeyEvent,
     QMouseEvent,
@@ -16,7 +17,7 @@ from PySide6.QtGui import (
     QPixmap,
     QTransform,
 )
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QDialog, QMessageBox, QVBoxLayout, QWidget
 
 
 @dataclass(frozen=True)
@@ -116,21 +117,48 @@ class SpatialMapModel:
             0.0,
             0.0,
             0.0,
-            -scale_y,
+            scale_y,
             0.0,
             -min_x * scale_x,
-            max_y * scale_y,
+            -min_y * scale_y,
             1.0,
         )
 
     def map_sample_point_to_pixel(self, x: float, y: float) -> QPointF:
-        """样品绝对 DPOS 转地图像素；显示采用 X 向右、Y 向上的笛卡尔方向。"""
+        """样品绝对 DPOS 转地图像素；按 CCD 观察方向显示为 X 向右、Y 向下。"""
         if self._world_to_map is None:
             raise RuntimeError("尚未设置地图坐标变换")
         x, y = float(x), float(y)
         if not isfinite(x) or not isfinite(y):
             raise ValueError("样品坐标必须是有限数值")
         return self._world_to_map.map(QPointF(x, y))
+
+    def map_pixel_point_to_sample(
+        self, point: QPointF | Sequence[float]
+    ) -> tuple[float, float]:
+        """把一个地图像素点转换为样品绝对坐标，单位为 mm。"""
+        if self._world_to_map is None:
+            raise RuntimeError("尚未设置地图坐标变换")
+        if isinstance(point, QPointF):
+            pixel_point = QPointF(point)
+        else:
+            values = tuple(float(value) for value in point)
+            if len(values) != 2:
+                raise ValueError("地图像素点必须包含 x、y")
+            pixel_point = QPointF(*values)
+        if not isfinite(pixel_point.x()) or not isfinite(pixel_point.y()):
+            raise ValueError("地图像素点必须是有限数值")
+        inside_map = (
+            0.0 <= pixel_point.x() <= self.width
+            and 0.0 <= pixel_point.y() <= self.height
+        )
+        if not inside_map:
+            raise ValueError("地图像素点不在地图范围内")
+        map_to_world, invertible = self._world_to_map.inverted()
+        if not invertible:
+            raise RuntimeError("地图坐标变换不可逆")
+        sample_point = map_to_world.map(pixel_point)
+        return float(sample_point.x()), float(sample_point.y())
 
     def clamp_pixel_rect(self, rect: QRect | Sequence[int]) -> QRect:
         if not isinstance(rect, QRect):
@@ -187,6 +215,8 @@ class SpatialMapWidget(QWidget):
     roi_selected = Signal(int, int, int, int)
     roi_sample_selected = Signal(float, float, float, float)
     selection_cancelled = Signal()
+    measurement_completed = Signal(float, float, float)
+    measurement_cancelled = Signal()
     state_changed = Signal()
 
     _TILE_BORDER_COLORS = {
@@ -202,8 +232,12 @@ class SpatialMapWidget(QWidget):
         self._map_pixmap: QPixmap | None = None
         self._tile_borders_visible = True
         self._selection_enabled = False
+        self._measurement_enabled = False
         self._drag_start: QPointF | None = None
         self._drag_current: QPointF | None = None
+        self._measurement_start: QPointF | None = None
+        self._measurement_end: QPointF | None = None
+        self._measurement_current: QPointF | None = None
         self.setMinimumSize(180, 140)
         self.setFocusPolicy(Qt.StrongFocus)
 
@@ -289,9 +323,42 @@ class SpatialMapWidget(QWidget):
 
     def set_selection_enabled(self, enabled: bool) -> None:
         self._selection_enabled = bool(enabled)
-        self.setCursor(Qt.CrossCursor if enabled else Qt.ArrowCursor)
+        if enabled:
+            self._measurement_enabled = False
+        self._update_interaction_cursor()
         if not enabled and self._drag_start is not None:
             self.cancel_selection(clear_roi=False)
+
+    def set_measurement_enabled(self, enabled: bool) -> None:
+        """启用两点测距；与矩形框选互斥，但不清除已选 ROI。"""
+        self._measurement_enabled = bool(enabled)
+        if enabled:
+            self._selection_enabled = False
+            if self._drag_start is not None:
+                self.cancel_selection(clear_roi=False)
+        self._update_interaction_cursor()
+
+    def _update_interaction_cursor(self) -> None:
+        active = self._selection_enabled or self._measurement_enabled
+        self.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+
+    def clear_measurement(self, *, emit_cancelled: bool = False) -> None:
+        had_measurement = any(
+            point is not None
+            for point in (
+                self._measurement_start,
+                self._measurement_end,
+                self._measurement_current,
+            )
+        )
+        self._measurement_start = None
+        self._measurement_end = None
+        self._measurement_current = None
+        if had_measurement:
+            if emit_cancelled:
+                self.measurement_cancelled.emit()
+            self.state_changed.emit()
+        self.update()
 
     def set_world_to_map_transform(self, transform: QTransform | Sequence[float]) -> None:
         self.model.set_world_to_map_transform(transform)
@@ -305,6 +372,11 @@ class SpatialMapWidget(QWidget):
         self, rect: QRect | QRectF | Sequence[float]
     ) -> tuple[float, float, float, float]:
         return self.model.map_pixel_rect_to_sample(rect)
+
+    def map_pixel_point_to_sample(
+        self, point: QPointF | Sequence[float]
+    ) -> tuple[float, float]:
+        return self.model.map_pixel_point_to_sample(point)
 
     def map_sample_point_to_pixel(self, x: float, y: float) -> QPointF:
         return self.model.map_sample_point_to_pixel(x, y)
@@ -390,7 +462,35 @@ class SpatialMapWidget(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.RightButton:
-            self.cancel_selection()
+            if self._measurement_enabled:
+                self.clear_measurement(emit_cancelled=True)
+            else:
+                self.cancel_selection()
+            event.accept()
+            return
+        if (
+            self._measurement_enabled
+            and event.button() == Qt.LeftButton
+            and self._map_view_rect().contains(event.position())
+        ):
+            self.setFocus(Qt.MouseFocusReason)
+            point = self._widget_to_map(event.position())
+            if self._measurement_start is None or self._measurement_end is not None:
+                self._measurement_start = point
+                self._measurement_end = None
+                self._measurement_current = point
+            else:
+                self._measurement_end = point
+                self._measurement_current = None
+                start_sample = self.model.map_pixel_point_to_sample(
+                    self._measurement_start
+                )
+                end_sample = self.model.map_pixel_point_to_sample(point)
+                dx = end_sample[0] - start_sample[0]
+                dy = end_sample[1] - start_sample[1]
+                self.measurement_completed.emit(dx, dy, hypot(dx, dy))
+            self.state_changed.emit()
+            self.update()
             event.accept()
             return
         if (
@@ -407,6 +507,15 @@ class SpatialMapWidget(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if (
+            self._measurement_enabled
+            and self._measurement_start is not None
+            and self._measurement_end is None
+        ):
+            self._measurement_current = self._widget_to_map(event.position())
+            self.update()
+            event.accept()
+            return
         if self._drag_start is None:
             super().mouseMoveEvent(event)
             return
@@ -437,7 +546,10 @@ class SpatialMapWidget(QWidget):
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() == Qt.Key_Escape:
-            self.cancel_selection()
+            if self._measurement_enabled:
+                self.clear_measurement(emit_cancelled=True)
+            else:
+                self.cancel_selection()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -488,9 +600,63 @@ class SpatialMapWidget(QWidget):
             painter.setBrush(QColor(24, 210, 208, 42))
             painter.drawRect(draw_rect)
 
+        measurement_end = self._measurement_end or self._measurement_current
+        if self._measurement_start is not None and measurement_end is not None:
+            start = self._map_to_widget(self._measurement_start)
+            end = self._map_to_widget(measurement_end)
+            painter.setPen(QPen(QColor("#ffd166"), 2.0, Qt.SolidLine, Qt.RoundCap))
+            painter.setBrush(QColor("#ffd166"))
+            painter.drawLine(start, end)
+            painter.drawEllipse(start, 4.0, 4.0)
+            painter.drawEllipse(end, 4.0, 4.0)
+
         painter.setPen(QPen(QColor("#555d69"), 1.0))
         painter.setBrush(Qt.NoBrush)
         painter.drawRect(view)
 
 
-__all__ = ["SpatialMapModel", "SpatialMapWidget", "SpatialTile"]
+class SpatialMapDialog(QDialog):
+    """非模态样品地图窗口；扫描运行时关闭会先请求停止硬件任务。"""
+
+    stop_requested = Signal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("样品地图")
+        self.setObjectName("spatialMapDialog")
+        self.setModal(False)
+        self.setMinimumSize(760, 560)
+        self.resize(1100, 760)
+        self.map_widget = SpatialMapWidget(self)
+        self._scan_running = False
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.addWidget(self.map_widget)
+
+    @property
+    def scan_running(self) -> bool:
+        return self._scan_running
+
+    def set_scan_running(self, running: bool) -> None:
+        self._scan_running = bool(running)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self._scan_running:
+            event.accept()
+            return
+        answer = QMessageBox.question(
+            self,
+            "停止空间扫描",
+            "空间扫描仍在运行。是否停止扫描并关闭样品地图？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            event.ignore()
+            return
+        self._scan_running = False
+        self.stop_requested.emit()
+        event.accept()
+
+
+__all__ = ["SpatialMapDialog", "SpatialMapModel", "SpatialMapWidget", "SpatialTile"]
