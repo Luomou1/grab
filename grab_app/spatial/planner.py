@@ -11,6 +11,9 @@ from .calibration import DEFAULT_PIXEL_SIZE_UM, validate_calibration_quality
 from .models import SpatialCalibration, SpatialRect, StagePoint, TilePlacement, TilePlan
 
 
+_SUPPORTED_ROUTES = {"serpentine", "serpentine_column", "unidirectional"}
+
+
 @dataclass(frozen=True)
 class SafetyLimits:
     """应用安全限位，单位 mm。"""
@@ -110,6 +113,24 @@ def _guaranteed_coverage_mm(
     return 2.0 * half_capacities[0] * scale, 2.0 * half_capacities[1] * scale
 
 
+def _order_grid(
+    grid: list[list[TilePlacement]], route: str
+) -> list[TilePlacement]:
+    """按扫描轴排列网格；蛇形列扫描在奇数列反转 Y 方向。"""
+    if route == "serpentine_column":
+        ordered: list[TilePlacement] = []
+        for column in range(len(grid[0])):
+            column_items = [row_items[column] for row_items in grid]
+            ordered.extend(reversed(column_items) if column % 2 else column_items)
+        return ordered
+
+    ordered = []
+    for row, row_items in enumerate(grid):
+        items = reversed(row_items) if route == "serpentine" and row % 2 else row_items
+        ordered.extend(items)
+    return ordered
+
+
 def plan_tiles(
     roi: SpatialRect,
     frame_size_px: tuple[int, int],
@@ -122,8 +143,10 @@ def plan_tiles(
     """生成完整覆盖 ROI 的最小规则网格，并严格校验整个帧视场。"""
     if not 0.05 <= overlap <= 0.1:
         raise ValueError("overlap 必须位于 [0.05, 0.1] 范围")
-    if route not in {"serpentine", "unidirectional"}:
-        raise ValueError("route 仅支持 serpentine 或 unidirectional")
+    if route not in _SUPPORTED_ROUTES:
+        raise ValueError(
+            "route 仅支持 serpentine、serpentine_column 或 unidirectional"
+        )
     if safety_limits is None:
         raise ValueError("自动规划必须提供应用安全限位")
     limits = safety_limits.as_rect() if isinstance(safety_limits, SafetyLimits) else safety_limits
@@ -148,10 +171,7 @@ def plan_tiles(
             row_items.append(TilePlacement(row, column, StagePoint(x_mm, y_mm), bounds))
         grid.append(row_items)
 
-    ordered: list[TilePlacement] = []
-    for row, row_items in enumerate(grid):
-        items = list(reversed(row_items)) if route == "serpentine" and row % 2 else row_items
-        ordered.extend(items)
+    ordered = _order_grid(grid, route)
     placements = tuple(
         TilePlacement(item.row, item.column, item.target, item.bounds, sequence)
         for sequence, item in enumerate(ordered)
@@ -185,8 +205,10 @@ def plan_center_scan(
     """按绝对 DPOS 视野中心规划概览，支持单行、单列和负坐标。"""
     if not 0.05 <= overlap <= 0.1:
         raise ValueError("overlap 必须位于 [0.05, 0.1] 范围")
-    if route not in {"serpentine", "unidirectional"}:
-        raise ValueError("route 仅支持 serpentine 或 unidirectional")
+    if route not in _SUPPORTED_ROUTES:
+        raise ValueError(
+            "route 仅支持 serpentine、serpentine_column 或 unidirectional"
+        )
     if safety_limits is None:
         raise ValueError("自动规划必须提供应用安全限位")
     limits = safety_limits.as_rect() if isinstance(safety_limits, SafetyLimits) else safety_limits
@@ -210,10 +232,7 @@ def plan_center_scan(
             row_items.append(TilePlacement(row, column, StagePoint(x_mm, y_mm), bounds))
         grid.append(row_items)
 
-    ordered: list[TilePlacement] = []
-    for row, row_items in enumerate(grid):
-        items = list(reversed(row_items)) if route == "serpentine" and row % 2 else row_items
-        ordered.extend(items)
+    ordered = _order_grid(grid, route)
     placements = tuple(
         TilePlacement(item.row, item.column, item.target, item.bounds, sequence)
         for sequence, item in enumerate(ordered)

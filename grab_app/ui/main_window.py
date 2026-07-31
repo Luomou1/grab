@@ -111,6 +111,12 @@ THEME_LABELS = {
     "light": "白色",
 }
 
+SPATIAL_ROUTE_VALUES = {
+    "蛇形-行": "serpentine",
+    "蛇形-列": "serpentine_column",
+    "单向": "unidirectional",
+}
+
 
 class DeviceStatusLabel(QLabel):
     def __init__(self, text: str) -> None:
@@ -1126,7 +1132,9 @@ class MainWindow(QMainWindow):
         self.spatial_overlap.setSuffix(" %")
         self.spatial_settle = self._ispin(0, 5000, 200)
         self.spatial_settle.setSuffix(" ms")
-        self.spatial_route = self._combo(["蛇形", "单向"], "蛇形")
+        self.spatial_route = self._combo(
+            list(SPATIAL_ROUTE_VALUES), "蛇形-行"
+        )
 
         layout.addWidget(self._label("像素间距 (µm/px)"), 0, 0)
         layout.addWidget(self.spatial_pixel_um, 0, 1)
@@ -2893,7 +2901,7 @@ class MainWindow(QMainWindow):
             calibration = default_calibration(
                 self.spatial_pixel_um.value(), fingerprint=self._spatial_calibration_fingerprint()
             )
-        route = "serpentine" if self.spatial_route.currentText() == "蛇形" else "unidirectional"
+        route = SPATIAL_ROUTE_VALUES[self.spatial_route.currentText()]
         return plan_center_scan(
             self.survey_x_start.value(), self.survey_x_end.value(),
             self.survey_y_start.value(), self.survey_y_end.value(),
@@ -2911,7 +2919,7 @@ class MainWindow(QMainWindow):
             calibration = default_calibration(
                 self.spatial_pixel_um.value(), fingerprint=self._spatial_calibration_fingerprint()
             )
-        route = "serpentine" if self.spatial_route.currentText() == "蛇形" else "unidirectional"
+        route = SPATIAL_ROUTE_VALUES[self.spatial_route.currentText()]
         return plan_tiles(
             rect,
             (int(self.camera.width), int(self.camera.height)),

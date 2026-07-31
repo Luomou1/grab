@@ -63,6 +63,16 @@ def test_main_window_builds_spatial_map_dialog_and_plans_tiles() -> None:
         assert window.spatial_overlap.minimum() == 5
         assert window.spatial_overlap.maximum() == 10
         assert window.spatial_overlap.value() == 10
+        assert [
+            window.spatial_route.itemText(index)
+            for index in range(window.spatial_route.count())
+        ] == ["蛇形-行", "蛇形-列", "单向"]
+        assert window.spatial_route.currentText() == "蛇形-行"
+        window.spatial_route.setCurrentText("蛇形-列")
+        assert window._plan_spatial_rect(SpatialRect(1.0, 1.0, 2.0, 2.0)).route == (
+            "serpentine_column"
+        )
+        assert window._plan_spatial_center_scan().route == "serpentine_column"
         assert window.btn_measure_spatial.text() == "测距"
         assert window.spatial_measurement_status.text() == "测距: 未测量"
         window._on_spatial_measurement_completed(0.003, -0.004, 0.005)

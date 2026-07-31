@@ -8,10 +8,10 @@ HTGE 相机 + PZT 位移台的纯 Python 采集程序，提供桌面 GUI、软�
 
 Windows x64 用户可从 [GitHub Releases](https://github.com/Luomou1/grab/releases/latest) 下载最新安装包。
 
-当前版本：`v2.1.0`
+当前版本：`v2.2.0`
 
 ```text
-grab_Setup_v2.1.0.exe
+grab_Setup_v2.2.0.exe
 SHA256: 以 GitHub Release 附件说明为准
 ```
 
@@ -82,12 +82,12 @@ python run_app.py
 输出目录：
 
 ```text
-release\grab_Setup_v2.1.0.exe
+release\grab_Setup_v2.2.0.exe
 ```
 
 详细说明见 [docs/打包安装包.md](docs/打包安装包.md)。
 
-当前版本的功能、验证结果和已知限制见 [v2.1.0 发布说明](docs/发布说明-v2.1.0.md)。
+当前版本的功能、验证结果和已知限制见 [v2.2.0 发布说明](docs/发布说明-v2.2.0.md)。
 
 ## 已实现的关键约束
 

@@ -105,6 +105,49 @@ class FakeScanner:
         return ScanResult(folder, completed_images=3, stopped=False, saved_images=3)
 
 
+class ReportingScanner(FakeScanner):
+    def __init__(self, *, corrected: bool = False) -> None:
+        super().__init__()
+        self.corrected = corrected
+
+    def run_sync(self, config: ScanConfig) -> ScanResult:
+        result = super().run_sync(config)
+        round_dir = result.folder / ("raw/Round_01" if self.corrected else "Round_01")
+        round_dir.mkdir(parents=True)
+        image_path = round_dir / "img_0001.tiff"
+        image_path.write_bytes(b"raw")
+        with (round_dir / "scan_log.csv").open(
+            "w", encoding="utf-8-sig", newline=""
+        ) as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "step", "target_um", "actual_um", "filename",
+                    "capture_count", "captured_at",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "step": 1,
+                    "target_um": 90.0,
+                    "actual_um": 90.02,
+                    "filename": image_path.name,
+                    "capture_count": 7,
+                    "captured_at": 123.5,
+                }
+            )
+        if self.corrected:
+            corrected_dir = result.folder / "corrected/Round_01"
+            corrected_dir.mkdir(parents=True)
+            (corrected_dir / image_path.name).write_bytes(b"corrected")
+        saved_images = 2 if self.corrected else 1
+        return ScanResult(
+            result.folder, completed_images=1, stopped=False,
+            saved_images=saved_images,
+        )
+
+
 def _plan(rect: SpatialRect):
     calibration = default_calibration(0.48)
     return calibration, plan_tiles(
@@ -144,6 +187,15 @@ def test_survey_uses_continuous_fresh_frames_and_keeps_trigger_mode(tmp_path: Pa
     ]
     assert (result.folder / "job.json").exists()
     assert (result.folder / "survey" / "tile_index.csv").exists()
+    report = (result.folder / "概览扫描报告.txt").read_text(encoding="utf-8")
+    assert "任务状态: 已完成" in report
+    assert "XY 路径: 蛇形-行" in report
+    assert f"网格: {plan.rows} 行 × {plan.columns} 列" in report
+    assert "标定矩阵 pixel = matrix @ DPOS + offset" in report
+    assert "瓦片明细" in report
+    assert "目标X(mm)" in report
+    assert "实际X(mm)" in report
+    assert "survey/tiles/tile_r0000_c0000.tiff" in report
 
 
 def test_survey_saves_actual_dpos_as_captured_view_center(tmp_path: Path) -> None:
@@ -219,6 +271,70 @@ def test_spatial_acquisition_runs_one_pzt_scan_per_xy_tile(tmp_path: Path) -> No
     assert all(config.save_dir.parent.name == "acquisition" for config in scanner.configs)
     assert all(config.trigger_mode == "soft" for config in scanner.configs)
     assert pzt.trigger_mode == "continuous"
+
+
+def test_spatial_acquisition_writes_human_readable_3d_stitching_reports(
+    tmp_path: Path,
+) -> None:
+    _, plan = _plan(SpatialRect(1.0, 1.0, 2.0, 1.4))
+    scanner = ReportingScanner()
+    worker = _worker(FakeCamera(), scanner, FakeStage(), [])
+    pzt = ScanConfig(
+        mode="center", channel=0, start_um=90, end_um=110, step_um=0.1,
+        stable_ms=200, repeats=1, trigger_mode="continuous", save_dir=tmp_path,
+        prefix="img", extension="tiff", bit_depth=8,
+    )
+
+    result = worker._run_acquisition(
+        SpatialAcquisitionConfig(plan, pzt, tmp_path, settle_ms=0)
+    )
+
+    guide_path = result.folder / "三维拼接说明.txt"
+    index_path = result.folder / "acquisition" / "三维拼接索引.csv"
+    guide = guide_path.read_text(encoding="utf-8")
+    with index_path.open("r", encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    assert "XY 路径: 蛇形-行" in guide
+    assert "PZT 扫描模式: 中心扫描" in guide
+    assert f"索引图像数: {plan.tile_count}" in guide
+    assert len(rows) == plan.tile_count
+    assert [int(row["tile_sequence"]) for row in rows] == list(range(plan.tile_count))
+    assert rows[0]["tile_sequence"] == "0"
+    assert rows[0]["row"] == "0"
+    assert rows[0]["column"] == "0"
+    assert float(rows[0]["actual_x_mm"]) == pytest.approx(plan.placements[0].target.x_mm)
+    assert float(rows[0]["actual_y_mm"]) == pytest.approx(plan.placements[0].target.y_mm)
+    assert float(rows[0]["actual_z_um"]) == pytest.approx(90.02)
+    assert rows[0]["image_kind"] == "raw"
+    assert rows[0]["image_relative_path"].endswith(
+        "Scan-test/Round_01/img_0001.tiff"
+    )
+    assert (result.folder / rows[0]["image_relative_path"]).is_file()
+
+
+def test_3d_stitching_index_distinguishes_raw_and_corrected_images(
+    tmp_path: Path,
+) -> None:
+    _, plan = _plan(SpatialRect(1.0, 1.0, 1.2, 1.2))
+    scanner = ReportingScanner(corrected=True)
+    worker = _worker(FakeCamera(), scanner, FakeStage(), [])
+    pzt = ScanConfig(
+        mode="normal", channel=0, start_um=90, end_um=110, step_um=0.1,
+        stable_ms=200, repeats=1, trigger_mode="continuous", save_dir=tmp_path,
+        prefix="img", extension="tiff", bit_depth=8,
+    )
+
+    result = worker._run_acquisition(
+        SpatialAcquisitionConfig(plan, pzt, tmp_path, settle_ms=0)
+    )
+
+    with (result.folder / "acquisition" / "三维拼接索引.csv").open(
+        "r", encoding="utf-8-sig", newline=""
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["image_kind"] for row in rows] == ["raw", "corrected"]
+    assert all((result.folder / row["image_relative_path"]).is_file() for row in rows)
 
 
 def test_stop_sets_all_device_cancellation_paths() -> None:

@@ -175,7 +175,7 @@ class TilePlan:
 
     @property
     def end_target(self) -> StagePoint:
-        """用户定义的绝对 DPOS 终点，不受蛇形行数奇偶影响。"""
+        """用户定义的绝对 DPOS 终点，不受蛇形执行顺序影响。"""
         return self._target_at(self.rows - 1, self.columns - 1)
 
     @property

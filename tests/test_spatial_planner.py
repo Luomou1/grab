@@ -50,6 +50,21 @@ def test_planner_generates_minimal_complete_serpentine_grid() -> None:
     assert [p.sequence for p in plan.placements] == list(range(9))
 
 
+def test_planner_generates_column_first_serpentine_grid() -> None:
+    plan = plan_tiles(
+        SpatialRect(0, 0, 1, 1),
+        (1000, 1000),
+        default_calibration(),
+        0.1,
+        route="serpentine_column",
+        safety_limits=SafetyLimits(-0.5, 1.5, -0.5, 1.5),
+    )
+
+    assert (plan.rows, plan.columns, plan.tile_count) == (3, 3, 9)
+    assert [p.row for p in plan.placements[:6]] == [0, 1, 2, 2, 1, 0]
+    assert [p.column for p in plan.placements[:6]] == [0, 0, 0, 1, 1, 1]
+
+
 def test_unidirectional_keeps_same_column_order_on_each_row() -> None:
     plan = plan_tiles(
         SpatialRect(0, 0, 0.8, 0.8), (1000, 1000), default_calibration(),
@@ -91,6 +106,22 @@ def test_center_scan_supports_single_row() -> None:
     assert plan.rows == 1
     assert plan.columns > 1
     assert {item.target.y_mm for item in plan.placements} == {3.0}
+
+
+def test_center_scan_supports_column_first_serpentine_route() -> None:
+    plan = plan_center_scan(
+        0.0, 1.0, 0.0, 1.0,
+        (1000, 1000), default_calibration(),
+        route="serpentine_column",
+        safety_limits=SafetyLimits(-1.0, 2.0, -1.0, 2.0),
+    )
+
+    first_column = plan.placements[:plan.rows]
+    second_column = plan.placements[plan.rows:2 * plan.rows]
+    assert [item.column for item in first_column] == [0] * plan.rows
+    assert [item.row for item in first_column] == list(range(plan.rows))
+    assert [item.column for item in second_column] == [1] * plan.rows
+    assert [item.row for item in second_column] == list(reversed(range(plan.rows)))
 
 
 def test_center_scan_keeps_start_and_allows_last_capture_to_cover_past_end() -> None:
